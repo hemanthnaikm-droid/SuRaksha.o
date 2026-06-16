@@ -501,6 +501,33 @@ function SOSModule({ user, contacts, currentLocation, onClose, addToast }) {
     log.push("📱 Emergency dialer triggered");
 
     // ── Real: WhatsApp deep link for each contact ──
+  const shareWhatsApp = async () => {
+  setSending(true);
+  const loc = lastLoc || await getLoc();
+  setLastLoc(loc);
+  const mapsLink = loc
+    ? `https://maps.google.com/maps?q=${loc.lat},${loc.lng}`
+    : "Location unavailable";
+  const userName = user?.displayName || user?.email?.split("@")[0] || "a Suraksha user";
+  const text = encodeURIComponent(
+    `🚨 SOS from ${userName}\nI may need help. My location:\n${mapsLink}`
+  );
+  // Send to ALL contacts via WhatsApp
+  if (contacts.length > 0) {
+    contacts.forEach(c => {
+      if (c.phone) {
+        const phone = c.phone.replace(/[^\d+]/g, "");
+        window.open(`https://wa.me/${phone}?text=${text}`, "_blank");
+      }
+    });
+    addToast("💬 WhatsApp Opened", `Sending location to ${contacts.length} contact(s) via WhatsApp.`, "success");
+  } else {
+    window.open(`https://wa.me/?text=${text}`, "_blank");
+    addToast("💬 WhatsApp", "No saved contacts — opening WhatsApp to pick a recipient.", "info");
+  }
+  setSending(false);
+};
+
     contacts.forEach(c => {
       const phone = c.phone.replace(/[^0-9]/g, "");
       const msg = encodeURIComponent(`🚨 SOS ALERT from ${user?.displayName || "Suraksha User"}!\nI need help. My location: ${locMsg}\nPlease call me immediately!`);
