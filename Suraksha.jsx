@@ -550,6 +550,42 @@ function SOSModule({ user, contacts, currentLocation, onClose, addToast }) {
 
   const cancelSOS = () => { clearInterval(timerRef.current); setState("idle"); setCount(5); };
   useEffect(() => () => clearInterval(timerRef.current), []);
+  // ── Shake to SOS ──────────────────────────────────────────
+useEffect(() => {
+  let lastX = 0, lastY = 0, lastZ = 0;
+  let shakeCount = 0;
+  let lastShake = 0;
+  const THRESHOLD = 15;
+  const handleMotion = (e) => {
+    const { x, y, z } = e.accelerationIncludingGravity || {};
+    if (x == null) return;
+    const diff = Math.abs(x - lastX) + Math.abs(y - lastY) + Math.abs(z - lastZ);
+    const now = Date.now();
+    if (diff > THRESHOLD) {
+      if (now - lastShake < 1000) {
+        shakeCount++;
+        if (shakeCount >= 3) {
+          shakeCount = 0;
+          startSOS(); // trigger SOS countdown
+        }
+      } else {
+        shakeCount = 1;
+      }
+      lastShake = now;
+    }
+    lastX = x; lastY = y; lastZ = z;
+  };
+  // iOS 13+ requires permission
+  if (typeof DeviceMotionEvent !== "undefined" &&
+      typeof DeviceMotionEvent.requestPermission === "function") {
+    DeviceMotionEvent.requestPermission()
+      .then(r => { if (r === "granted") window.addEventListener("devicemotion", handleMotion); })
+      .catch(() => {});
+  } else {
+    window.addEventListener("devicemotion", handleMotion);
+  }
+  return () => window.removeEventListener("devicemotion", handleMotion);
+}, []);
 
   const quickActions = [
     {
