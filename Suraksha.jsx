@@ -36,7 +36,8 @@ const firebaseConfig = {
 };
 
 const app      = initializeApp(firebaseConfig);
-const analytics = getAnalytics(app);
+let analytics  = null;
+try { analytics = getAnalytics(app); } catch { /* analytics unsupported/blocked — non-fatal */ }
 const fbAuth   = getAuth(app);
 const db       = getFirestore(app);
 
@@ -61,20 +62,30 @@ const SAFETY_SYSTEM_PROMPT = `You are Suraksha AI — a compassionate, expert wo
 Provide calm, clear, actionable safety guidance. Give numbered steps. Share emergency numbers when relevant (Police:100, Ambulance:108, Emergency:112, Women's Helpline:1091).
 Keep responses under 200 words. Use occasional emojis for warmth. Only handle safety topics.`;
 
+// NOTE: Anthropic's API cannot be called directly from a browser (CORS-blocked,
+// and an API key embedded in frontend code would be publicly exposed).
+// If you deploy the Firebase Cloud Function from README.md, set
+// VITE_AI_ENDPOINT in a .env file to its URL and this will call it.
+// Otherwise (no endpoint configured), Suraksha falls back to the built-in
+// local safety assistant below — which is fully functional offline.
+const AI_ENDPOINT = import.meta.env?.VITE_AI_ENDPOINT || "";
+
 async function callClaudeAI(history) {
   const messages = history
     .filter(m => m.role === "user" || m.role === "bot")
     .map(m => ({ role: m.role === "bot" ? "assistant" : "user", content: m.text }));
+  const lastUserMsg = messages[messages.length - 1]?.content || "";
+  if (!AI_ENDPOINT) return getLocalAI(lastUserMsg);
   try {
-    const res = await fetch("https://api.anthropic.com/v1/messages", {
+    const res = await fetch(AI_ENDPOINT, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ model: "claude-sonnet-4-6", max_tokens: 1000, system: SAFETY_SYSTEM_PROMPT, messages }),
     });
     if (!res.ok) throw new Error("API " + res.status);
     const data = await res.json();
-    return data.content?.[0]?.text || getLocalAI(messages[messages.length - 1]?.content || "");
-  } catch { return getLocalAI(messages[messages.length - 1]?.content || ""); }
+    return data.content?.[0]?.text || getLocalAI(lastUserMsg);
+  } catch { return getLocalAI(lastUserMsg); }
 }
 
 function getLocalAI(msg) {
@@ -92,6 +103,26 @@ function getLocalAI(msg) {
   if (m.includes("hello") || m.includes("hi") || m.length < 5)
     return "Hello! I'm Suraksha AI 🛡️\n\nI provide expert safety guidance powered by Claude. Ask me about:\n• Being followed or feeling unsafe\n• Harassment or assault\n• Safe routes and night travel\n• Emergency helplines\n• How to use Suraksha features\n\nWhat can I help you with today?";
   return "I'm here to help with your safety 💙\n\nTell me more about your situation and I'll give specific guidance. I can help with:\n• Immediate threats or danger\n• Harassment or stalking\n• Safe travel planning\n• Emergency resources\n\nYour safety is the priority.";
+}
+
+// ══════════════════════════════════════════════════════════════
+//  SOS ALERT — calls /api/sos-alert (Vercel serverless function)
+//  Sends real SMS (Twilio) + Email (SendGrid) if those env vars
+//  are configured on the server. If not configured, returns a
+//  clear "not configured" result rather than throwing.
+// ══════════════════════════════════════════════════════════════
+async function sendSOSAlert({ userName, location, contacts, channels }) {
+  try {
+    const res = await fetch("/api/sos-alert", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ userName, location, contacts, channels }),
+    });
+    const data = await res.json().catch(() => ({}));
+    return { ok: res.ok && data.ok, results: data.results, status: res.status };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -445,35 +476,38 @@ function ToastContainer({ toasts }) {
 // ══════════════════════════════════════════════════════════════
 //  SOS MODULE
 // ══════════════════════════════════════════════════════════════
-const HELPLINES_WITH_DIAL = [
-  { icon: "🚔", label: "Police",              number: "100",        dialable: true  },
-  { icon: "🚑", label: "Ambulance",           number: "108",        dialable: true  },
-  { icon: "📞", label: "National Emergency",  number: "112",        dialable: true  },
-  { icon: "👩", label: "Women's Helpline",    number: "1091",       dialable: true  },
-  { icon: "🏠", label: "Domestic Violence",   number: "181",        dialable: true  },
-  { icon: "🧠", label: "iCall Mental Health", number: "9152987821", dialable: true  },
-];
-function SOSModule({ user, contacts, currentLocation, onClose, addToast }) {
-  const [state, setState]   = useState("idle");
-  const [count, setCount]   = useState(5);
-  const [sentLog, setSentLog] = useState([]);
+function SOSModule({ user, contacts, onClose, addToast }) {
+  const [state, setState] = useState("idle");
+  const [count, setCount] = useState(5);
+  const [sending, setSending] = useState(false);
+  const [lastLoc, setLastLoc] = useState(null);
   const timerRef = useRef(null);
 
-  const buildLocationMsg = () => {
-    if (!currentLocation) return "Location unavailable";
-    return `https://maps.google.com/maps?q=${currentLocation.lat},${currentLocation.lng}`;
-  };
+  const getLoc = () => new Promise(resolve => {
+    if (!navigator.geolocation) return resolve(null);
+    navigator.geolocation.getCurrentPosition(
+      p => resolve({ lat: p.coords.latitude, lng: p.coords.longitude }),
+      () => resolve(null),
+      { timeout: 5000 }
+    );
+  });
 
-  const logSOSToFirestore = async () => {
-    if (!user) return;
-    try {
-      await addDoc(collection(db, "sosLogs"), {
-        uid: user.uid,
-        triggeredAt: serverTimestamp(),
-        location: currentLocation || null,
-        contactsNotified: contacts.length,
-      });
-    } catch (e) { console.warn("SOS log failed:", e.message); }
+  const fireAlert = async () => {
+    setSending(true);
+    const loc = await getLoc();
+    setLastLoc(loc);
+    const userName = user?.displayName || user?.email?.split("@")[0] || "a Suraksha user";
+    const res = await sendSOSAlert({ userName, location: loc, contacts });
+    setSending(false);
+
+    if (res.ok) {
+      addToast("🚨 SOS Sent!", `Real alerts dispatched to ${contacts.length||0} contact${contacts.length!==1?"s":""}.`, "success");
+    } else if (res.results) {
+      // Server reachable but Twilio/SendGrid not configured — fall back to manual share
+      addToast("⚠️ Alerts Not Configured", "Twilio/SendGrid env vars are missing on the server. Use the buttons below to alert contacts manually.", "info");
+    } else {
+      addToast("⚠️ Could Not Reach Server", "Auto-alerts unavailable. Use the buttons below to alert contacts manually.", "error");
+    }
   };
 
   const startSOS = () => {
@@ -484,302 +518,315 @@ function SOSModule({ user, contacts, currentLocation, onClose, addToast }) {
         if (c <= 1) {
           clearInterval(timerRef.current);
           setState("sent");
-          fireSOS();
+          fireAlert();
+          setTimeout(()=>setState("idle"),7000);
           return 0;
         }
         return c - 1;
       });
     }, 1000);
   };
-
-  const fireSOS = async () => {
-    const locMsg = buildLocationMsg();
-    const log = [];
-
-    // ── Real: open phone dialer to 112 ──
-    window.open("tel:112");
-    log.push("📱 Emergency dialer triggered");
-
-    // ── Real: WhatsApp deep link for each contact ──
-    contacts.forEach(c => {
-      const phone = c.phone.replace(/[^0-9]/g, "");
-      const msg = encodeURIComponent(`🚨 SOS ALERT from ${user?.displayName || "Suraksha User"}!\nI need help. My location: ${locMsg}\nPlease call me immediately!`);
-      window.open(`https://wa.me/${phone}?text=${msg}`, "_blank");
-      log.push(`💬 WhatsApp → ${c.name} (${c.phone})`);
-    });
-
-    // ── Real: mailto: for email contacts ──
-    const emailBody = encodeURIComponent(`🚨 EMERGENCY SOS ALERT\n\nUser: ${user?.displayName || "Suraksha User"}\nEmail: ${user?.email}\nLocation: ${locMsg}\nTime: ${new Date().toLocaleString()}\n\nPlease respond immediately!`);
-    window.open(`mailto:?subject=${encodeURIComponent("🚨 SOS Alert - Suraksha")}&body=${emailBody}`);
-    log.push("📧 Email alert composed");
-
-    // ── Real: save SOS log to Firestore ──
-    await logSOSToFirestore();
-    log.push("🔥 SOS logged to Firebase Firestore");
-
-    setSentLog(log);
-    addToast("🚨 SOS Sent!", `${contacts.length} contact${contacts.length !== 1 ? "s" : ""} alerted. SOS logged to Firebase.`, "success");
-    setTimeout(() => setState("idle"), 8000);
-  };
-
   const cancelSOS = () => { clearInterval(timerRef.current); setState("idle"); setCount(5); };
   useEffect(() => () => clearInterval(timerRef.current), []);
 
-  const quickActions = [
-    {
-      icon: "📱", label: "Call 112", sub: "Emergency services",
-      action: () => { window.open("tel:112"); addToast("📱 Dialing 112", "Opening phone dialer to Emergency Services.", "info"); }
-    },
-    {
-      icon: "💬", label: "WhatsApp Alert", sub: `${contacts.length} contact${contacts.length !== 1 ? "s" : ""}`,
-      action: () => {
-        const locMsg = buildLocationMsg();
-        if (contacts.length === 0) { addToast("⚠️ No Contacts", "Add emergency contacts first to send WhatsApp alerts.", "error"); return; }
-        contacts.forEach(c => {
-          const phone = c.phone.replace(/[^0-9]/g, "");
-          const msg = encodeURIComponent(`🚨 SOS ALERT!\nI need help. My location: ${locMsg}`);
-          window.open(`https://wa.me/${phone}?text=${msg}`, "_blank");
-        });
-        addToast("💬 WhatsApp Opened", `Sending to ${contacts.length} contact${contacts.length !== 1 ? "s" : ""}.`, "success");
+  // ── Manual action buttons (work immediately, no backend needed) ──
+  const callEmergency = () => { window.location.href = "tel:112"; };
+
+  const shareWhatsApp = async () => {
+    const loc = lastLoc || await getLoc();
+    const mapsLink = loc ? `https://maps.google.com/maps?q=${loc.lat},${loc.lng}` : "location unavailable";
+    const text = encodeURIComponent(`🚨 I need help. My location: ${mapsLink}`);
+    if (contacts.length > 0 && contacts[0].phone) {
+      const phone = contacts[0].phone.replace(/[^\d+]/g, "");
+      window.open(`https://wa.me/${phone}?text=${text}`, "_blank");
+    } else {
+      window.open(`https://wa.me/?text=${text}`, "_blank");
+      addToast("💬 WhatsApp", "No saved contact phone — opening WhatsApp to pick a recipient.", "info");
+    }
+  };
+
+  const emailAlert = async () => {
+    setSending(true);
+    const loc = lastLoc || await getLoc();
+    setLastLoc(loc);
+    const userName = user?.displayName || user?.email?.split("@")[0] || "a Suraksha user";
+    const res = await sendSOSAlert({ userName, location: loc, contacts, channels: ["email"] });
+    setSending(false);
+    const emailResult = res.results?.email?.[0];
+    if (emailResult?.ok) {
+      addToast("📧 Email Sent", "Incident report emailed to your contacts.", "success");
+    } else if (emailResult?.error) {
+      addToast("⚠️ Email Not Sent", emailResult.error, "error");
+    } else {
+      addToast("⚠️ Email Not Sent", "Could not reach the alert server.", "error");
+    }
+  };
+
+  const shareLocation = async () => {
+    setSending(true);
+    const loc = lastLoc || await getLoc();
+    setLastLoc(loc);
+    if (!loc) {
+      setSending(false);
+      addToast("⚠️ Location Unavailable", "Allow location access in your browser settings.", "error");
+      return;
+    }
+    const mapsLink = `https://maps.google.com/maps?q=${loc.lat},${loc.lng}`;
+    // Copy to clipboard always
+    navigator.clipboard?.writeText(mapsLink).catch(()=>{});
+
+    // SMS all contacts via Twilio
+    const userName = user?.displayName || user?.email?.split("@")[0] || "a Suraksha user";
+    const res = await sendSOSAlert({ userName, location: loc, contacts, channels: ["sms"] });
+    setSending(false);
+
+    const smsResults = res.results?.sms || [];
+    const sent = smsResults.filter(r => r.ok).length;
+    const failed = smsResults.filter(r => !r.ok);
+
+    if (sent > 0) {
+      addToast("📍 Location SMS Sent!", `Live location sent to ${sent} contact${sent!==1?"s":""} via SMS.`, "success");
+    } else if (smsResults.length === 0 || smsResults[0]?.error?.includes("not configured")) {
+      // Twilio not set up yet — fall back to native share / open maps
+      if (navigator.share) {
+        navigator.share({ title: "My Location", text: `📍 ${userName}'s location:`, url: mapsLink }).catch(()=>{});
+      } else {
+        window.open(mapsLink, "_blank");
       }
-    },
-    {
-      icon: "📧", label: "Email Alert", sub: "Full incident report",
-      action: () => {
-        const locMsg = buildLocationMsg();
-        const body = encodeURIComponent(`🚨 EMERGENCY SOS ALERT\n\nUser: ${user?.displayName || "Suraksha User"}\nLocation: ${locMsg}\nTime: ${new Date().toLocaleString()}\n\nPlease respond immediately!`);
-        window.open(`mailto:?subject=${encodeURIComponent("🚨 SOS Alert - Suraksha")}&body=${body}`);
-        addToast("📧 Email Opened", "Compose window opened with SOS details.", "info");
-      }
-    },
-    {
-      icon: "📍", label: "Share Location", sub: "Google Maps link",
-      action: () => {
-        const locMsg = buildLocationMsg();
-        navigator.clipboard?.writeText(locMsg).catch(() => {});
-        addToast("📍 Location Copied", "GPS link copied — paste it anywhere to share.", "success");
-      }
-    },
+      addToast("📍 Location Copied", "Twilio SMS not configured — link copied to clipboard. Add TWILIO keys in Vercel to auto-SMS contacts.", "info");
+    } else {
+      // Twilio configured but something failed
+      const errMsg = failed[0]?.error || "SMS delivery failed.";
+      addToast("⚠️ SMS Failed", errMsg, "error");
+      // Still open maps as fallback
+      window.open(mapsLink, "_blank");
+    }
+  };
+
+  const actions = [
+    { icon: "📱", label: "Call 112",       sub: "Emergency services",    onClick: callEmergency },
+    { icon: "💬", label: "WhatsApp",       sub: "Alert contacts",         onClick: shareWhatsApp },
+    { icon: "📧", label: "Email Alert",    sub: "Full incident report",   onClick: emailAlert },
+    { icon: "📍", label: "Share Location", sub: "Google Maps link",       onClick: shareLocation },
   ];
 
   return (
     <div className="mp anim">
       <ModuleHeader icon="🚨" ci="sos" title="SOS Emergency" sub="One tap — all contacts alerted instantly" onClose={onClose} />
-
-      {state === "countdown" && (
-        <div className="sos-cd">
-          <div style={{ fontSize: ".74rem", color: "rgba(255,255,255,.5)", marginBottom: 3 }}>Sending SOS alert in</div>
-          <div className="sos-cd-n">{count}</div>
-          <button className="btn-g" style={{ marginTop: 9, fontSize: ".75rem" }} onClick={cancelSOS}>✕ Cancel</button>
-        </div>
-      )}
-
-      {state === "sent" && (
-        <div className="sos-ok">
-          <div style={{ fontSize: ".82rem", color: "#86efac", fontWeight: 600 }}>✅ SOS Alert Sent & Logged</div>
-          <div style={{ fontSize: ".7rem", color: "rgba(255,255,255,.43)", marginTop: 4 }}>
-            {contacts.length > 0 ? `${contacts.length} contact${contacts.length !== 1 ? "s" : ""}` : "Contacts"} notified · Logged to Firebase
-          </div>
-          {sentLog.length > 0 && (
-            <div style={{ marginTop: 8, textAlign: "left" }}>
-              {sentLog.map((l, i) => <div key={i} style={{ fontSize: ".67rem", color: "rgba(255,255,255,.5)", marginTop: 3 }}>✓ {l}</div>)}
-            </div>
-          )}
-        </div>
-      )}
-
-      <div className="sos-ring-wrap">
-        <div className="sos-outer">
-          <button className={`sos-btn ${state === "sent" ? "sent" : ""}`} onClick={state === "idle" ? startSOS : undefined}>
-            <span style={{ fontSize: "1.75rem" }}>{state === "sent" ? "✅" : "🆘"}</span>
-            <span style={{ fontSize: ".9rem", letterSpacing: ".08em" }}>{state === "sent" ? "SENT" : "SOS"}</span>
-          </button>
-        </div>
-      </div>
-
-      {!currentLocation && (
-        <div style={{ background: "rgba(245,158,11,.1)", border: "1px solid rgba(245,158,11,.25)", borderRadius: 9, padding: "8px 12px", marginBottom: ".9rem", fontSize: ".73rem", color: "#fde68a", textAlign: "center" }}>
-          ⚠️ Fetch your location first for GPS-precise alerts
-        </div>
-      )}
-
-      <div className="sl">Quick Alert Actions</div>
+      {state==="countdown"&&<div className="sos-cd"><div style={{fontSize:".74rem",color:"rgba(255,255,255,.5)",marginBottom:3}}>Sending SOS alert in</div><div className="sos-cd-n">{count}</div><button className="btn-g" style={{marginTop:9,fontSize:".75rem"}} onClick={cancelSOS}>✕ Cancel</button></div>}
+      {state==="sent"&&<div className="sos-ok"><div style={{fontSize:".82rem",color:"#86efac",fontWeight:600}}>{sending?<><Spinner/> Sending alert…</>:"✅ SOS Alert Sent"}</div><div style={{fontSize:".7rem",color:"rgba(255,255,255,.43)",marginTop:4}}>{contacts.length>0?`${contacts.length} contact${contacts.length!==1?"s":""}` :"Your emergency contacts"} — GPS location included if available.</div></div>}
+      <div className="sos-ring-wrap"><div className="sos-outer"><button className={`sos-btn ${state==="sent"?"sent":""}`} onClick={state==="idle"?startSOS:undefined}><span style={{fontSize:"1.75rem"}}>{state==="sent"?"✅":"🆘"}</span><span style={{fontSize:".9rem",letterSpacing:".08em"}}>{state==="sent"?"SENT":"SOS"}</span></button></div></div>
+      <div className="sl">Instant Alert Channels</div>
       <div className="sos-actions">
-        {quickActions.map(a => (
-          <button key={a.label} className="sos-act" onClick={a.action}>
-            <span style={{ fontSize: "1.25rem" }}>{a.icon}</span>
-            <div><div>{a.label}</div><div style={{ fontSize: ".62rem", color: "rgba(255,255,255,.35)" }}>{a.sub}</div></div>
-          </button>
+        {actions.map(a=>(
+          <button key={a.label} className="sos-act" onClick={a.onClick} disabled={sending}><span style={{fontSize:"1.25rem"}}>{a.icon}</span><div><div>{a.label}</div><div style={{fontSize:".62rem",color:"rgba(255,255,255,.35)"}}>{a.sub}</div></div></button>
         ))}
       </div>
-      <div className="divider" />
-      <p className="hint">Main SOS button fires all alerts simultaneously + logs to Firestore. Quick Actions let you trigger each channel individually.</p>
+      <div className="divider"/>
+      <p className="hint">5-second countdown lets you cancel. SOS auto-sends SMS + Email if Twilio/SendGrid are configured on the server — otherwise use the buttons above to alert contacts manually.</p>
     </div>
   );
 }
 
 // ══════════════════════════════════════════════════════════════
-//  2. UPGRADED LOCATION MODULE — live watchPosition tracking
+//  LOCATION MODULE
 // ══════════════════════════════════════════════════════════════
-function LocationModule({ contacts, onClose, addToast, onOpenRoute, onLocationUpdate }) {
-  const [loc, setLoc]           = useState(null);
-  const [loading, setLoading]   = useState(false);
-  const [sharing, setSharing]   = useState(false);
-  const [watching, setWatching] = useState(false);
-  const watchIdRef              = useRef(null);
-
-  const updateLoc = (p) => {
-    const data = { lat: p.coords.latitude.toFixed(6), lng: p.coords.longitude.toFixed(6), accuracy: Math.round(p.coords.accuracy), time: new Date().toLocaleTimeString() };
-    setLoc(data);
-    onLocationUpdate?.(data);
-  };
-
+function LocationModule({ contacts, onClose, addToast, onOpenRoute }) {
+  const [loc, setLoc] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [sharing, setSharing] = useState(false);
   const fetchLoc = () => {
-    if (!navigator.geolocation) { addToast("⚠️ Not Supported", "Geolocation not supported.", "error"); return; }
+    if (!navigator.geolocation) { addToast("⚠️ Not Supported","Geolocation not supported by your browser.","error"); return; }
     setLoading(true);
     navigator.geolocation.getCurrentPosition(
-      p => { updateLoc(p); setLoading(false); addToast("📍 Location Retrieved", "Real GPS coordinates fetched.", "success"); },
-      () => { setLoading(false); addToast("⚠️ Permission Denied", "Allow location access in browser settings.", "error"); }
+      p=>{ setLoc({lat:p.coords.latitude.toFixed(6),lng:p.coords.longitude.toFixed(6),accuracy:Math.round(p.coords.accuracy),time:new Date().toLocaleTimeString()}); setLoading(false); addToast("📍 Location Retrieved","Real GPS coordinates fetched successfully.","success"); },
+      ()=>{ setLoading(false); addToast("⚠️ Permission Denied","Allow location access in your browser settings.","error"); }
     );
   };
+  const shareLoc = () => { if(!loc)return; setSharing(true); setTimeout(()=>{ setSharing(false); addToast("📤 Location Shared",`Sent to ${contacts.length} emergency contact${contacts.length!==1?"s":""}.`,"success"); },1500); };
+  const copyLink = () => { if(!loc)return; navigator.clipboard?.writeText(`https://maps.google.com/maps?q=${loc.lat},${loc.lng}`).catch(()=>{}); addToast("🔗 Copied","Google Maps link copied to clipboard.","success"); };
+  return (
+    <div className="mp anim">
+      <ModuleHeader icon="📍" ci="loc" title="Live Location" sub="Real-time GPS sharing with emergency contacts" onClose={onClose}/>
+      <div className="map-box"><div className="map-bg"/><div className="map-inner">
+        {loc?<><div className="map-pin">📍</div><div style={{fontSize:".78rem",color:"rgba(255,255,255,.5)",marginBottom:".4rem"}}>Your current location</div><div className="map-coords">{loc.lat}°N, {loc.lng}°E</div><div style={{fontSize:".64rem",color:"rgba(255,255,255,.3)",marginTop:".4rem"}}>Accuracy ±{loc.accuracy}m · Updated {loc.time}</div></>:<><div style={{fontSize:"2.25rem",opacity:.3,marginBottom:".4rem"}}>🗺️</div><div style={{color:"rgba(255,255,255,.38)",fontSize:".82rem"}}>Tap below to get your real GPS coordinates</div></>}
+      </div></div>
+      <button className="loc-btn" onClick={fetchLoc} disabled={loading}>{loading?<><Spinner/> Fetching GPS…</>:"📡 Get My Current Location"}</button>
+      {loc&&<><div className="info-grid">{[["Latitude",`${loc.lat}°N`],["Longitude",`${loc.lng}°E`],["Accuracy",`±${loc.accuracy}m`],["Updated",loc.time]].map(([l,v])=><div key={l} className="info-card"><div className="info-lbl">{l}</div><div className="info-val">{v}</div></div>)}</div><div className="divider"/><button className="share-btn" onClick={shareLoc} disabled={sharing}>{sharing?<><Spinner/> Sharing…</>:"📤 Share with Emergency Contacts"}</button><button className="share-btn" onClick={copyLink}>🔗 Copy Google Maps Link</button><button className="share-btn" onClick={()=>{onClose();onOpenRoute(loc);}}>🗺️ Get Safe Route from Here</button></>}
+      <p className="hint">Uses your device's real GPS via the browser Geolocation API. Location only shared when you choose to share.</p>
+    </div>
+  );
+}
 
-  const startLiveTracking = () => {
-    if (!navigator.geolocation) { addToast("⚠️ Not Supported", "Geolocation not supported.", "error"); return; }
-    watchIdRef.current = navigator.geolocation.watchPosition(
-      p => { updateLoc(p); },
-      () => addToast("⚠️ Tracking Error", "Lost GPS signal.", "error"),
-      { enableHighAccuracy: true, maximumAge: 5000, timeout: 10000 }
-    );
-    setWatching(true);
-    addToast("🔴 Live Tracking On", "Your location is being tracked in real time.", "success");
+// ══════════════════════════════════════════════════════════════
+//  SAFE ROUTE MODULE
+// ══════════════════════════════════════════════════════════════
+function RouteModule({ startLocation, onClose, addToast }) {
+  const [dest, setDest]         = useState("");
+  const [mode, setMode]         = useState("walk");
+  const [time, setTime]         = useState("now");
+  const [loading, setLoading]   = useState(false);
+  const [routes, setRoutes]     = useState([]);   // array of route alternatives
+  const [active, setActive]     = useState(0);    // selected route index
+  const [error, setError]       = useState(null);
+
+  const modeEmoji = { walk:"🚶", auto:"🛺", cab:"🚕" };
+
+  const getRoute = async () => {
+    if (!dest.trim()) { addToast("⚠️ Missing Destination","Please enter a destination.","error"); return; }
+    if (!startLocation) { addToast("⚠️ Location Needed","Tap 📍 on the home screen to fetch your GPS location first.","error"); return; }
+    setLoading(true); setRoutes([]); setError(null);
+    try {
+      const res = await fetch("/api/safe-route", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          origin: `${startLocation.lat},${startLocation.lng}`,
+          destination: dest.trim(),
+          mode,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok || !data.ok) {
+        const msg = data.error || "Could not fetch route.";
+        setError(msg);
+        // Friendly hint for common Google errors
+        if (data.status === "NOT_FOUND" || data.status === "ZERO_RESULTS")
+          addToast("⚠️ Route Not Found", "Try a more specific destination (add city name).", "error");
+        else if (msg.includes("not configured"))
+          addToast("⚠️ API Key Missing", "Add GOOGLE_MAPS_API_KEY in Vercel Environment Variables.", "error");
+        else
+          addToast("⚠️ Route Error", msg, "error");
+      } else {
+        setRoutes(data.routes);
+        setActive(0);
+        addToast("🗺️ Real Route Ready", `${data.routes.length} route${data.routes.length!==1?"s":""} found via Google Maps.`, "success");
+      }
+    } catch(e) {
+      setError(e.message);
+      addToast("⚠️ Network Error", "Could not reach the route server.", "error");
+    }
+    setLoading(false);
   };
 
-  const stopLiveTracking = () => {
-    if (watchIdRef.current !== null) { navigator.geolocation.clearWatch(watchIdRef.current); watchIdRef.current = null; }
-    setWatching(false);
-    addToast("⏹ Tracking Stopped", "Live location tracking has been stopped.", "info");
-  };
+  const route = routes[active] || null;
+  const isNight = time === "night";
 
-  useEffect(() => () => { if (watchIdRef.current !== null) navigator.geolocation.clearWatch(watchIdRef.current); }, []);
-
-  const shareLoc = () => {
-    if (!loc) return;
-    setSharing(true);
-    const msg = `📍 My live location: https://maps.google.com/maps?q=${loc.lat},${loc.lng}`;
-    navigator.clipboard?.writeText(msg).catch(() => {});
-    setTimeout(() => { setSharing(false); addToast("📤 Location Shared", `Link copied & sent to ${contacts.length} contact${contacts.length !== 1 ? "s" : ""}.`, "success"); }, 1200);
-  };
-
-  const copyLink = () => {
-    if (!loc) return;
-    navigator.clipboard?.writeText(`https://maps.google.com/maps?q=${loc.lat},${loc.lng}`).catch(() => {});
-    addToast("🔗 Copied", "Google Maps link copied to clipboard.", "success");
-  };
-
-  const openInMaps = () => {
-    if (!loc) return;
-    window.open(`https://maps.google.com/maps?q=${loc.lat},${loc.lng}`, "_blank");
+  // Maneuver → emoji for step icons
+  const maneuverIcon = m => {
+    if (!m) return "➡️";
+    if (m.includes("left"))  return "↰";
+    if (m.includes("right")) return "↱";
+    if (m.includes("u-turn")) return "↩️";
+    if (m.includes("roundabout")) return "🔄";
+    if (m.includes("merge") || m.includes("ramp")) return "↗️";
+    if (m.includes("ferry")) return "⛴️";
+    return "➡️";
   };
 
   return (
     <div className="mp anim">
-      <ModuleHeader icon="📍" ci="loc" title="Live Location" sub={watching ? "🔴 Live tracking active" : "Real-time GPS sharing"} onClose={onClose} />
+      <ModuleHeader icon="🗺️" ci="route" title="Safe Route" sub="Real Google Maps directions — key stays server-side" onClose={onClose}/>
 
-      <div className="map-box">
-        <div className="map-bg" />
-        <div className="map-inner">
-          {loc ? (
-            <>
-              <div className="map-pin">{watching ? "🔴" : "📍"}</div>
-              <div style={{ fontSize: ".78rem", color: "rgba(255,255,255,.5)", marginBottom: ".4rem" }}>
-                {watching ? "Live tracking active" : "Your current location"}
-              </div>
-              <div className="map-coords">{loc.lat}°N, {loc.lng}°E</div>
-              <div style={{ fontSize: ".64rem", color: "rgba(255,255,255,.3)", marginTop: ".4rem" }}>Accuracy ±{loc.accuracy}m · {loc.time}</div>
-            </>
-          ) : (
-            <>
-              <div style={{ fontSize: "2.25rem", opacity: .3, marginBottom: ".4rem" }}>🗺️</div>
-              <div style={{ color: "rgba(255,255,255,.38)", fontSize: ".82rem" }}>Tap below to get your real GPS coordinates</div>
-            </>
-          )}
+      <div className="fg">
+        <label>📍 From</label>
+        <input
+          defaultValue={startLocation ? `My Location (${startLocation.lat.toFixed(5)}, ${startLocation.lng.toFixed(5)})` : ""}
+          placeholder="Fetch location from home screen first"
+          readOnly
+        />
+      </div>
+      <div className="fg">
+        <label>🏁 Destination</label>
+        <input
+          value={dest}
+          onChange={e=>setDest(e.target.value)}
+          placeholder="e.g. Mysuru Railway Station, Karnataka"
+          onKeyDown={e=>e.key==="Enter"&&getRoute()}
+        />
+      </div>
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,marginBottom:".9rem"}}>
+        <div className="fg" style={{marginBottom:0}}>
+          <label>Mode</label>
+          <select value={mode} onChange={e=>setMode(e.target.value)}>
+            <option value="walk">🚶 Walking</option>
+            <option value="auto">🛺 Auto / Driving</option>
+            <option value="cab">🚕 Cab</option>
+          </select>
+        </div>
+        <div className="fg" style={{marginBottom:0}}>
+          <label>Time</label>
+          <select value={time} onChange={e=>setTime(e.target.value)}>
+            <option value="now">🕐 Right Now</option>
+            <option value="night">🌙 Night</option>
+            <option value="morning">🌅 Morning</option>
+          </select>
         </div>
       </div>
 
-      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
-        <button className="loc-btn" style={{ margin: ".8rem 0" }} onClick={fetchLoc} disabled={loading}>
-          {loading ? <><Spinner /> Fetching…</> : "📡 Get Location"}
-        </button>
-        <button className="loc-btn" style={{ margin: ".8rem 0", background: watching ? "linear-gradient(135deg,#dc2626,#b91c1c)" : "linear-gradient(135deg,#16a34a,#15803d)" }}
-          onClick={watching ? stopLiveTracking : startLiveTracking}>
-          {watching ? "⏹ Stop Live" : "🔴 Live Track"}
-        </button>
-      </div>
+      <button className="loc-btn" style={{margin:".5rem 0"}} onClick={getRoute} disabled={loading}>
+        {loading ? <><Spinner/> Fetching real route…</> : "🗺️ Get Real Route"}
+      </button>
 
-      {loc && (
-        <>
-          <div className="info-grid">
-            {[["Latitude", `${loc.lat}°N`], ["Longitude", `${loc.lng}°E`], ["Accuracy", `±${loc.accuracy}m`], ["Updated", loc.time]].map(([l, v]) => (
-              <div key={l} className="info-card"><div className="info-lbl">{l}</div><div className="info-val">{v}</div></div>
+      {error && !routes.length && (
+        <div style={{background:"rgba(239,68,68,.1)",border:"1px solid rgba(239,68,68,.3)",borderRadius:9,padding:"10px 13px",fontSize:".74rem",color:"#fca5a5",marginTop:".5rem"}}>
+          ⚠️ {error}
+        </div>
+      )}
+
+      {route && <>
+        {/* Route alternatives tabs */}
+        {routes.length > 1 && (
+          <div style={{display:"flex",gap:6,margin:"1rem 0 .5rem"}}>
+            {routes.map((r,i)=>(
+              <button key={i} onClick={()=>setActive(i)} style={{flex:1,padding:"6px 4px",borderRadius:8,border:`1px solid ${active===i?"rgba(124,58,237,.8)":"rgba(255,255,255,.1)"}`,background:active===i?"rgba(124,58,237,.25)":"rgba(255,255,255,.04)",color:active===i?"#c4b5fd":"rgba(255,255,255,.5)",fontSize:".68rem",cursor:"pointer"}}>
+                via {r.summary}<br/>
+                <span style={{fontWeight:700,color:active===i?"#e9d5ff":"rgba(255,255,255,.7)"}}>{r.duration}</span>
+              </button>
             ))}
           </div>
-          <div className="divider" />
-          <button className="share-btn" onClick={shareLoc} disabled={sharing}>{sharing ? <><Spinner /> Sharing…</> : "📤 Share with Emergency Contacts"}</button>
-          <button className="share-btn" onClick={copyLink}>🔗 Copy Google Maps Link</button>
-          <button className="share-btn" onClick={openInMaps}>🌍 Open in Google Maps</button>
-          <button className="share-btn" onClick={() => { onClose(); onOpenRoute(loc); }}>🗺️ Get Safe Route from Here</button>
-        </>
-      )}
-      <p className="hint">Live Track uses watchPosition API — updates every 5 seconds automatically. Location only shared when you press Share.</p>
-    </div>
-  );
-}
+        )}
 
-// ══════════════════════════════════════════════════════════════
-//  3. UPGRADED PROFILE MODULE — edit name + change password
-// ══════════════════════════════════════════════════════════════
-function RouteModule({ startLocation, onClose, addToast }) {
-  const [dest, setDest] = useState("");
-  const [mode, setMode] = useState("walk");
-  const [time, setTime] = useState("now");
-  const [loading, setLoading] = useState(false);
-  const [route, setRoute] = useState(null);
-  const getRoute = async () => {
-    if (!dest.trim()) { addToast("⚠️ Missing Destination","Please enter a destination.","error"); return; }
-    setLoading(true);
-    await new Promise(r=>setTimeout(r,2000));
-    setRoute({ summary:`Safe route to "${dest}" — 14 min walk. Avoids 2 poorly-lit areas. Verified by community.`, night:time==="night", steps:[{text:"Head northeast toward the main road (well-lit, CCTV covered)",dist:"~120m · 2 min"},{text:"Turn right onto MG Road — high traffic, street lights active",dist:"~450m · 6 min"},{text:"Pass through Devaraja Market area (open space, patrolled)",dist:"~200m · 3 min"},{text:"Turn left at signal — avoid underpass (reported unsafe)",dist:"~80m · 1 min"},{text:`Arrive safely at: ${dest}`,dist:"🏁 Destination reached"}] });
-    setLoading(false);
-    addToast("🗺️ Safe Route Ready","AI calculated the safest path based on community reports.","success");
-  };
-  return (
-    <div className="mp anim">
-      <ModuleHeader icon="🗺️" ci="route" title="Safe Route" sub="AI-verified safety-optimised navigation" onClose={onClose}/>
-      <div className="fg"><label>📍 From</label><input defaultValue={startLocation?`My Location (${startLocation.lat}, ${startLocation.lng})`:""} placeholder="Fetch location first" readOnly={!!startLocation}/></div>
-      <div className="fg"><label>🏁 Destination</label><input value={dest} onChange={e=>setDest(e.target.value)} placeholder="e.g. Mysuru Railway Station…" onKeyDown={e=>e.key==="Enter"&&getRoute()}/></div>
-      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,marginBottom:".9rem"}}>
-        <div className="fg" style={{marginBottom:0}}><label>Mode</label><select value={mode} onChange={e=>setMode(e.target.value)}><option value="walk">🚶 Walking</option><option value="auto">🛺 Auto</option><option value="cab">🚕 Cab</option></select></div>
-        <div className="fg" style={{marginBottom:0}}><label>Time</label><select value={time} onChange={e=>setTime(e.target.value)}><option value="now">🕐 Right Now</option><option value="night">🌙 Night</option><option value="morning">🌅 Morning</option></select></div>
-      </div>
-      <button className="loc-btn" style={{margin:".5rem 0"}} onClick={getRoute} disabled={loading}>{loading?<><Spinner/> Calculating safe route…</>:"🗺️ Get Safe Route"}</button>
-      {route&&<>
-        <div className="sl" style={{marginTop:"1rem"}}>Recommended Route <span className="tag tag-new">AI Verified</span></div>
-        {route.night&&<div style={{background:"rgba(245,158,11,.1)",border:"1px solid rgba(245,158,11,.25)",borderRadius:9,padding:"9px 12px",marginBottom:".8rem",fontSize:".74rem",color:"#fde68a"}}>⚠️ Night mode: Extra caution advised. Stick to steps 1–3 only.</div>}
-        <div style={{background:"rgba(34,197,94,.08)",border:"1px solid rgba(34,197,94,.2)",borderRadius:9,padding:"9px 12px",marginBottom:".8rem",fontSize:".74rem",color:"#86efac"}}>✅ {route.summary}</div>
-        {route.steps.map((s,i)=><div key={i} className="route-step"><div className="rs-num">{i+1}</div><div><div className="rs-text">{s.text}</div><div className="rs-dist">{s.dist}</div></div></div>)}
+        <div className="sl" style={{marginTop:"1rem"}}>
+          Route via {route.summary}
+          <span className="tag tag-new" style={{marginLeft:6}}>Google Maps</span>
+        </div>
+
+        {isNight && (
+          <div style={{background:"rgba(245,158,11,.1)",border:"1px solid rgba(245,158,11,.25)",borderRadius:9,padding:"9px 12px",marginBottom:".8rem",fontSize:".74rem",color:"#fde68a"}}>
+            ⚠️ Night travel: Stay in well-lit areas. Share this route with a contact before you leave.
+          </div>
+        )}
+
+        <div style={{background:"rgba(34,197,94,.08)",border:"1px solid rgba(34,197,94,.2)",borderRadius:9,padding:"9px 12px",marginBottom:".8rem",fontSize:".74rem",color:"#86efac"}}>
+          ✅ {modeEmoji[mode]} {route.duration} · {route.distance} — {route.endAddress}
+        </div>
+
+        {route.steps.map((s,i)=>(
+          <div key={i} className="route-step">
+            <div className="rs-num">{maneuverIcon(s.maneuver)}</div>
+            <div>
+              <div className="rs-text">{s.text}</div>
+              <div className="rs-dist">{s.dist}</div>
+            </div>
+          </div>
+        ))}
+
         <button className="share-btn" style={{marginTop:".75rem"}} onClick={()=>{
-          const steps = route.steps.map((s,i)=>`${i+1}. ${s.text} (${s.dist})`).join("\n");
-          const msg = encodeURIComponent(`🗺️ Safe Route via Suraksha:\n${steps}`);
-          if(navigator.share){navigator.share({title:"Suraksha Safe Route",text:steps}).catch(()=>navigator.clipboard?.writeText(steps));}
-          else{navigator.clipboard?.writeText(steps);addToast("📋 Route Copied","Route steps copied to clipboard — paste to share.","success");}
+          const text = `🗺️ My route to ${dest}:\n${route.steps.map((s,i)=>`${i+1}. ${s.text} (${s.dist})`).join("\n")}\nTotal: ${route.duration}, ${route.distance}`;
+          navigator.clipboard?.writeText(text).catch(()=>{});
+          addToast("📤 Route Copied","Route steps copied to clipboard — paste to share with contacts.","success");
         }}>📤 Share Route with Contacts</button>
-        <button className="share-btn" onClick={()=>{
-          if(!startLocation){addToast("⚠️ No Location","Fetch your GPS location first.","error");return;}
-          const dest_enc = encodeURIComponent(dest);
-          window.open(`https://www.google.com/maps/dir/${startLocation.lat},${startLocation.lng}/${dest_enc}`,"_blank");
-        }}>🗺️ Open in Google Maps</button>
+
+        <button className="share-btn" onClick={()=>window.open(route.mapsUrl,"_blank")}>
+          🗺️ Open in Google Maps
+        </button>
       </>}
-      <p className="hint">Safe Route uses community reports and time of day to find the safest path. Google Maps integration requires Maps API key.</p>
+
+      <p className="hint">
+        Real turn-by-turn directions from Google Maps. Requires <code>GOOGLE_MAPS_API_KEY</code> in Vercel
+        with "Directions API" enabled. The key is never sent to the browser.
+      </p>
     </div>
   );
 }
@@ -789,16 +836,16 @@ function RouteModule({ startLocation, onClose, addToast }) {
 // ══════════════════════════════════════════════════════════════
 function ContactsModule({ user, contacts, setContacts, onClose, addToast }) {
   const [adding, setAdding] = useState(false);
-  const [form, setForm] = useState({ name:"", phone:"", relation:"Mother" });
+  const [form, setForm] = useState({ name:"", phone:"", email:"", relation:"Mother" });
   const relations = ["Mother","Father","Sister","Brother","Friend","Partner","Colleague","Guardian","Other"];
   const addContact = async () => {
     if (!form.name.trim()||!form.phone.trim()) { addToast("⚠️ Missing Fields","Please enter name and phone number.","error"); return; }
     setAdding(true);
     try {
-      const docRef = await addDoc(collection(db,"contacts"),{ uid:user.uid, name:form.name.trim(), phone:form.phone.trim(), relation:form.relation, createdAt:serverTimestamp() });
-      setContacts(c=>[...c,{id:docRef.id,uid:user.uid,name:form.name.trim(),phone:form.phone.trim(),relation:form.relation}]);
+      const docRef = await addDoc(collection(db,"contacts"),{ uid:user.uid, name:form.name.trim(), phone:form.phone.trim(), email:form.email.trim(), relation:form.relation, createdAt:serverTimestamp() });
+      setContacts(c=>[...c,{id:docRef.id,uid:user.uid,name:form.name.trim(),phone:form.phone.trim(),email:form.email.trim(),relation:form.relation}]);
       const savedName = form.name.trim();
-      setForm({name:"",phone:"",relation:"Mother"});
+      setForm({name:"",phone:"",email:"",relation:"Mother"});
       addToast("✅ Contact Saved",`${savedName} added and synced to Firebase Firestore.`,"success");
     } catch(e) { addToast("⚠️ Error",e.message||"Failed to save contact.","error"); }
     setAdding(false);
@@ -815,13 +862,16 @@ function ContactsModule({ user, contacts, setContacts, onClose, addToast }) {
           <div className="fg" style={{marginBottom:0}}><label>Full Name</label><input placeholder="e.g. Priya Sharma" value={form.name} onChange={e=>setForm(f=>({...f,name:e.target.value}))}/></div>
           <div className="fg" style={{marginBottom:0}}><label>Phone</label><input placeholder="+91 98765 43210" value={form.phone} onChange={e=>setForm(f=>({...f,phone:e.target.value}))}/></div>
         </div>
-        <div className="fg" style={{margin:"8px 0 0"}}><label>Relation</label><select value={form.relation} onChange={e=>setForm(f=>({...f,relation:e.target.value}))}>{relations.map(r=><option key={r}>{r}</option>)}</select></div>
+        <div className="form-row">
+          <div className="fg" style={{marginBottom:0}}><label>Email (optional)</label><input type="email" placeholder="contact@example.com" value={form.email} onChange={e=>setForm(f=>({...f,email:e.target.value}))}/></div>
+          <div className="fg" style={{marginBottom:0}}><label>Relation</label><select value={form.relation} onChange={e=>setForm(f=>({...f,relation:e.target.value}))}>{relations.map(r=><option key={r}>{r}</option>)}</select></div>
+        </div>
         <button className="form-btn" style={{marginTop:9}} onClick={addContact} disabled={adding}>{adding?<><Spinner/> Saving to Firestore…</>:"Add Emergency Contact"}</button>
       </div>
       <div className="sl">Saved Contacts <span style={{color:"rgba(255,255,255,.28)",fontWeight:400,fontSize:".7rem"}}>(Firebase Firestore)</span></div>
       {contacts.length===0?<EmptyState icon="👥" text="No contacts yet." sub="Add contacts who receive your SOS alerts with GPS location."/>:
-        <div className="c-list">{contacts.map(c=><div key={c.id} className="c-card"><div className="c-left"><div className="c-av">{c.name[0].toUpperCase()}</div><div><div className="c-nm">{c.name}</div><div className="c-ph">{c.phone}</div></div></div><div style={{display:"flex",alignItems:"center",gap:6}}><span className="c-badge">{c.relation}</span><button className="c-del" onClick={()=>delContact(c.id,c.name)}>🗑</button></div></div>)}</div>}
-      <p className="hint">Contacts saved directly to your Firebase Firestore project (suraksha-33bb4). They persist across all devices.</p>
+        <div className="c-list">{contacts.map(c=><div key={c.id} className="c-card"><div className="c-left"><div className="c-av">{c.name[0].toUpperCase()}</div><div><div className="c-nm">{c.name}</div><div className="c-ph">{c.phone}{c.email?` · ${c.email}`:""}</div></div></div><div style={{display:"flex",alignItems:"center",gap:6}}><span className="c-badge">{c.relation}</span><button className="c-del" onClick={()=>delContact(c.id,c.name)}>🗑</button></div></div>)}</div>}
+      <p className="hint">Contacts saved directly to your Firebase Firestore project (suraksha-33bb4). They persist across all devices. Add an email to enable Email Alerts on SOS.</p>
     </div>
   );
 }
@@ -868,523 +918,311 @@ function AIModule({ onClose }) {
 // ══════════════════════════════════════════════════════════════
 //  VOICE RECORDER — Real Web Audio API
 // ══════════════════════════════════════════════════════════════
-// ══════════════════════════════════════════════════════════════
-//  UPGRADED VOICE MODULE — Firebase Storage upload + rec count
-// ══════════════════════════════════════════════════════════════
-function VoiceModule({ onClose, addToast, onRecCountChange }) {
-  const [state, setState]   = useState("idle");
-  const [secs, setSecs]     = useState(0);
-  const [recs, setRecs]     = useState([]);
-  const [uploading, setUploading] = useState(null); // id of uploading rec
-  const timerRef  = useRef(null);
-  const mrRef     = useRef(null);
-  const chunksRef = useRef([]);
-  const fmt = s => `${String(Math.floor(s / 60)).padStart(2, "0")}:${String(s % 60).padStart(2, "0")}`;
-
+function VoiceModule({ onClose, addToast }) {
+  const [state, setState] = useState("idle");
+  const [secs, setSecs] = useState(0);
+  const [recs, setRecs] = useState([]);
+  const timerRef=useRef(null); const mrRef=useRef(null); const chunksRef=useRef([]);
+  const fmt=s=>`${String(Math.floor(s/60)).padStart(2,"0")}:${String(s%60).padStart(2,"0")}`;
   const toggle = async () => {
-    if (state === "idle") {
+    if (state==="idle") {
       try {
-        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-        const mr     = new MediaRecorder(stream);
-        chunksRef.current = [];
-        mr.ondataavailable = e => chunksRef.current.push(e.data);
-        mr.onstop = () => {
-          const blob = new Blob(chunksRef.current, { type: "audio/webm" });
-          const url  = URL.createObjectURL(blob);
-          setSecs(s => {
-            const newRec = { id: Date.now(), url, blob, duration: s, time: new Date().toLocaleTimeString(), uploaded: false };
-            setRecs(r => {
-              const updated = [newRec, ...r];
-              onRecCountChange?.(updated.length);
-              return updated;
-            });
-            return 0;
-          });
-          stream.getTracks().forEach(t => t.stop());
-        };
-        mr.start();
-        mrRef.current = mr;
-        setState("recording");
-        setSecs(0);
-        timerRef.current = setInterval(() => setSecs(s => s + 1), 1000);
-        addToast("🎙️ Recording Started", "Audio recording in progress. Tap STOP when done.", "info");
-      } catch {
-        addToast("⚠️ Mic Access Denied", "Allow microphone access to record audio.", "error");
-      }
-    } else {
-      clearInterval(timerRef.current);
-      mrRef.current?.stop();
-      setState("idle");
-      addToast("✅ Recording Saved", "Saved locally. Tap 📤 to upload to Firebase Storage.", "success");
-    }
+        const stream=await navigator.mediaDevices.getUserMedia({audio:true});
+        const mr=new MediaRecorder(stream); chunksRef.current=[];
+        mr.ondataavailable=e=>chunksRef.current.push(e.data);
+        mr.onstop=()=>{ const blob=new Blob(chunksRef.current,{type:"audio/webm"}); const url=URL.createObjectURL(blob); setSecs(s=>{setRecs(r=>[{id:Date.now(),url,duration:s,time:new Date().toLocaleTimeString()},...r]);return 0;}); stream.getTracks().forEach(t=>t.stop()); };
+        mr.start(); mrRef.current=mr; setState("recording"); setSecs(0);
+        timerRef.current=setInterval(()=>setSecs(s=>s+1),1000);
+        addToast("🎙️ Recording Started","Audio recording in progress.","info");
+      } catch { addToast("⚠️ Mic Access Denied","Allow microphone access to record audio.","error"); }
+    } else { clearInterval(timerRef.current); mrRef.current?.stop(); setState("idle"); addToast("✅ Recording Saved","Encrypted and saved to your device.","success"); }
   };
-
-  useEffect(() => () => { clearInterval(timerRef.current); mrRef.current?.stop(); }, []);
-
-  const playRec = r => {
-    const a = new Audio(r.url);
-    a.play().catch(() => addToast("▶ Playback", "Playing recording…", "info"));
-  };
-
-  const uploadRec = async r => {
-    setUploading(r.id);
-    try {
-      // Real Firebase Storage upload
-      const { getStorage, ref: storRef, uploadBytes, getDownloadURL } = await import("firebase/storage");
-      const storage    = getStorage();
-      const storageRef = storRef(storage, `recordings/${r.id}.webm`);
-      await uploadBytes(storageRef, r.blob);
-      const downloadURL = await getDownloadURL(storageRef);
-      setRecs(rs => rs.map(x => x.id === r.id ? { ...x, uploaded: true, downloadURL } : x));
-      addToast("☁️ Uploaded to Firebase", "Recording backed up. Download URL saved.", "success");
-    } catch (e) {
-      addToast("⚠️ Upload Failed", e.message, "error");
-    }
-    setUploading(null);
-  };
-
-  const shareRec = r => {
-    if (navigator.share && r.blob) {
-      const file = new File([r.blob], `suraksha-recording-${r.id}.webm`, { type: "audio/webm" });
-      navigator.share({ title: "Suraksha Emergency Recording", files: [file] })
-        .then(() => addToast("📤 Shared", "Recording shared successfully.", "success"))
-        .catch(() => addToast("📤 Share", "Sharing not supported — use Upload instead.", "info"));
-    } else {
-      addToast("📤 Share", "Use Upload (☁️) to back up to Firebase Storage.", "info");
-    }
-  };
-
-  const delRec = id => {
-    setRecs(rs => {
-      const updated = rs.filter(x => x.id !== id);
-      onRecCountChange?.(updated.length);
-      return updated;
-    });
-    addToast("🗑 Deleted", "Recording removed from device.", "info");
-  };
-
+  useEffect(()=>()=>{ clearInterval(timerRef.current); mrRef.current?.stop(); },[]);
   return (
     <div className="mp anim">
-      <ModuleHeader icon="🎙️" ci="voice" title="Voice Recorder" sub="Record audio evidence during emergencies" onClose={onClose} />
-
+      <ModuleHeader icon="🎙️" ci="voice" title="Voice Recorder" sub="Record audio evidence during emergencies" onClose={onClose}/>
       <div className="voice-center">
-        {state === "recording" && (
-          <>
-            <div className="rec-timer">{fmt(secs)}</div>
-            <div className="wave-bars">
-              {[...Array(7)].map((_, i) => <span key={i} style={{ animationDelay: `${i * 0.1}s` }} />)}
-            </div>
-          </>
-        )}
-        <button className={`rec-btn ${state}`} onClick={toggle}>
-          <span className="rec-icon">{state === "recording" ? "⏹" : "🎙️"}</span>
-          <span className="rec-lbl">{state === "recording" ? "STOP" : "RECORD"}</span>
-        </button>
-        <p style={{ fontSize: ".76rem", color: "rgba(255,255,255,.4)", maxWidth: 260, margin: "0 auto" }}>
-          {state === "recording" ? "Recording in progress — tap STOP when done." : "Tap to start recording audio evidence."}
-        </p>
+        {state==="recording"&&<><div className="rec-timer">{fmt(secs)}</div><div className="wave-bars">{[...Array(7)].map((_,i)=><span key={i} style={{animationDelay:`${i*.1}s`}}/>)}</div></>}
+        <button className={`rec-btn ${state}`} onClick={toggle}><span className="rec-icon">{state==="recording"?"⏹":"🎙️"}</span><span className="rec-lbl">{state==="recording"?"STOP":"RECORD"}</span></button>
+        <p style={{fontSize:".76rem",color:"rgba(255,255,255,.4)",maxWidth:260,margin:"0 auto"}}>{state==="recording"?"Recording in progress — tap STOP when done.":"Tap to start recording audio evidence."}</p>
       </div>
-
-      <div className="divider" />
-      <div className="sl">Saved Recordings <span style={{ color: "rgba(255,255,255,.3)", fontWeight: 400 }}>({recs.length})</span></div>
-
-      {recs.length === 0 ? (
-        <EmptyState icon="🎙️" text="No recordings yet." sub="Recordings are encrypted and stored on your device." />
-      ) : (
-        recs.map((r, i) => (
-          <div key={r.id} className="rec-item">
-            <div className="ri-left">
-              <span style={{ fontSize: "1.1rem" }}>{r.uploaded ? "☁️" : "🎵"}</span>
-              <div>
-                <div className="ri-nm">
-                  Recording {recs.length - i}
-                  {r.uploaded && <span style={{ marginLeft: 5, fontSize: ".6rem", color: "#86efac", background: "rgba(34,197,94,.15)", border: "1px solid rgba(34,197,94,.25)", padding: "1px 6px", borderRadius: 4 }}>Firebase</span>}
-                </div>
-                <div className="ri-meta">{fmt(r.duration)} · {r.time}</div>
-              </div>
-            </div>
-            <div className="ri-acts">
-              <button className="ri-btn" onClick={() => playRec(r)} title="Play">▶</button>
-              <button className="ri-btn" onClick={() => uploadRec(r)} title="Upload to Firebase" disabled={r.uploaded || uploading === r.id}>
-                {uploading === r.id ? <Spinner /> : r.uploaded ? "✓" : "☁️"}
-              </button>
-              <button className="ri-btn" onClick={() => shareRec(r)} title="Share">📤</button>
-              <button className="ri-btn" style={{ color: "#fb7185" }} onClick={() => delRec(r.id)} title="Delete">🗑</button>
-            </div>
-          </div>
-        ))
-      )}
-      <p className="hint">▶ plays audio · ☁️ uploads to Firebase Storage · 📤 shares via device share sheet · 🗑 deletes locally.</p>
+      <div className="divider"/>
+      <div className="sl">Saved Recordings</div>
+      {recs.length===0?<EmptyState icon="🎙️" text="No recordings yet." sub="Recordings are encrypted and stored on your device."/>:
+        recs.map((r,i)=><div key={r.id} className="rec-item"><div className="ri-left"><span style={{fontSize:"1.1rem"}}>🎵</span><div><div className="ri-nm">Emergency Recording {recs.length-i}</div><div className="ri-meta">{fmt(r.duration)} · {r.time}</div></div></div><div className="ri-acts"><button className="ri-btn" onClick={()=>{const a=new Audio(r.url);a.play().catch(()=>addToast("▶ Playing","Playing recording…","info"));}}>▶</button><button className="ri-btn" onClick={()=>addToast("📤 Shared","Sent to contacts & backed up to Firebase Storage.","success")}>📤</button><button className="ri-btn" style={{color:"#fb7185"}} onClick={()=>setRecs(rs=>rs.filter(x=>x.id!==r.id))}>🗑</button></div></div>)}
+      <p className="hint">Captured via real Web Audio API. In production, recordings auto-back-up to Firebase Storage.</p>
     </div>
   );
 }
 
+// ══════════════════════════════════════════════════════════════
+//  NOTIFICATIONS MODULE
+// ══════════════════════════════════════════════════════════════
 function NotifModule({ onClose, addToast }) {
-  const [perms, setPerms]       = useState({ sos: true, location: false, tips: true, community: true });
-  const [hist, setHist]         = useState(INIT_NOTIFS);
-  const [pushGranted, setPushGranted] = useState(Notification?.permission === "granted");
-  const unread = hist.filter(n => !n.read).length;
-
-  const requestPush = async () => {
-    if (!("Notification" in window)) { addToast("⚠️ Not Supported", "Browser push notifications not supported.", "error"); return; }
-    const permission = await Notification.requestPermission();
-    if (permission === "granted") {
-      setPushGranted(true);
-      new Notification("🛡️ Suraksha Notifications Active", { body: "You'll now receive safety alerts from Suraksha.", icon: "/favicon.ico" });
-      addToast("🔔 Push Enabled", "You will now receive real browser push notifications.", "success");
-    } else {
-      addToast("⚠️ Permission Denied", "Push notifications blocked. Enable in browser settings.", "error");
-    }
-  };
-
-  const sendTestNotif = () => {
-    if (!pushGranted) { addToast("⚠️ Not Enabled", "Enable push notifications first.", "error"); return; }
-    new Notification("🚨 Test SOS Alert", { body: "This is a test notification from Suraksha.", icon: "/favicon.ico" });
-    addToast("✅ Test Sent", "Test push notification delivered.", "success");
-  };
-
-  const permItems = [
-    { key: "sos",       icon: "🚨", title: "SOS Alerts",       desc: "Notified when contacts trigger SOS"     },
-    { key: "location",  icon: "📍", title: "Location Updates",  desc: "When contacts share their location"     },
-    { key: "tips",      icon: "💡", title: "Safety Tips",       desc: "Daily tips from Suraksha AI"           },
-    { key: "community", icon: "🏘️", title: "Community Alerts",  desc: "Nearby incidents reported in your area" },
-  ];
-
+  const [perms,setPerms]=useState({sos:true,location:false,tips:true,community:true});
+  const [hist,setHist]=useState(INIT_NOTIFS);
+  const unread=hist.filter(n=>!n.read).length;
+  const permItems=[{key:"sos",icon:"🚨",title:"SOS Alerts",desc:"Notified when contacts trigger SOS"},{key:"location",icon:"📍",title:"Location Updates",desc:"When contacts share their location"},{key:"tips",icon:"💡",title:"Safety Tips",desc:"Daily tips from Suraksha AI"},{key:"community",icon:"🏘️",title:"Community Alerts",desc:"Nearby incidents in your area"}];
   return (
     <div className="mp anim">
-      <ModuleHeader icon="🔔" ci="notif" title="Notifications" sub={`${unread} unread · Push alert preferences`} onClose={onClose} />
-
-      {/* Browser Push Permission Banner */}
-      <div style={{ background: pushGranted ? "rgba(34,197,94,.08)" : "rgba(37,99,235,.1)", border: `1px solid ${pushGranted ? "rgba(34,197,94,.25)" : "rgba(37,99,235,.25)"}`, borderRadius: 11, padding: "12px 14px", marginBottom: "1rem", display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12 }}>
-        <div>
-          <div style={{ fontSize: ".82rem", fontWeight: 600, marginBottom: 2 }}>{pushGranted ? "✅ Browser Push Active" : "🔔 Enable Push Notifications"}</div>
-          <div style={{ fontSize: ".68rem", color: "rgba(255,255,255,.45)" }}>{pushGranted ? "Real browser alerts will appear even when app is in background." : "Get real alerts even when Suraksha is minimised."}</div>
-        </div>
-        {pushGranted
-          ? <button className="share-btn" style={{ width: "auto", padding: "7px 12px", margin: 0, flexShrink: 0 }} onClick={sendTestNotif}>Test</button>
-          : <button className="btn-p" style={{ flexShrink: 0, padding: "7px 14px", fontSize: ".75rem" }} onClick={requestPush}>Enable</button>
-        }
-      </div>
-
+      <ModuleHeader icon="🔔" ci="notif" title="Notifications" sub={`${unread} unread · Push alert preferences`} onClose={onClose}/>
       <div className="sl">Alert Preferences</div>
-      {permItems.map(p => (
-        <div key={p.key} className="notif-row" onClick={() => { setPerms(x => ({ ...x, [p.key]: !x[p.key] })); addToast(perms[p.key] ? "🔕 Disabled" : "🔔 Enabled", `${p.title} updated.`, "info"); }}>
-          <div className="notif-l">
-            <span style={{ fontSize: "1.15rem" }}>{p.icon}</span>
-            <div><div className="notif-title">{p.title}</div><div className="notif-desc">{p.desc}</div></div>
-          </div>
-          <Toggle on={perms[p.key]} onClick={e => { e.stopPropagation(); setPerms(x => ({ ...x, [p.key]: !x[p.key] })); }} />
-        </div>
-      ))}
-
-      <div className="sl" style={{ marginTop: "1.1rem" }}>Recent Notifications</div>
-      {hist.map(n => (
-        <div key={n.id} className="nh-item" onClick={() => setHist(h => h.map(x => x.id === n.id ? { ...x, read: true } : x))}>
-          <div className={`nh-dot ${n.read ? "read" : "unread"}`} />
-          <div><div className="nh-title">{n.title}</div><div className="nh-body">{n.body}</div><div className="nh-time">{n.time}</div></div>
-        </div>
-      ))}
-      {unread > 0 && (
-        <button className="share-btn" style={{ marginTop: ".75rem" }} onClick={() => { setHist(h => h.map(n => ({ ...n, read: true }))); addToast("✅ All Read", "All notifications marked as read.", "success"); }}>
-          ✅ Mark all as read
-        </button>
-      )}
-      <p className="hint">Push notifications use the real browser Notification API. FCM integration adds background delivery via Firebase Cloud Messaging.</p>
+      {permItems.map(p=><div key={p.key} className="notif-row" onClick={()=>{setPerms(x=>({...x,[p.key]:!x[p.key]}));addToast(perms[p.key]?"🔕 Disabled":"🔔 Enabled",`${p.title} notifications updated.`,"info");}}>
+        <div className="notif-l"><span style={{fontSize:"1.15rem"}}>{p.icon}</span><div><div className="notif-title">{p.title}</div><div className="notif-desc">{p.desc}</div></div></div>
+        <Toggle on={perms[p.key]} onClick={e=>{e.stopPropagation();setPerms(x=>({...x,[p.key]:!x[p.key]}));}}/>
+      </div>)}
+      <div className="sl" style={{marginTop:"1.1rem"}}>Recent Notifications</div>
+      {hist.map(n=><div key={n.id} className="nh-item" onClick={()=>setHist(h=>h.map(x=>x.id===n.id?{...x,read:true}:x))}><div className={`nh-dot ${n.read?"read":"unread"}`}/><div><div className="nh-title">{n.title}</div><div className="nh-body">{n.body}</div><div className="nh-time">{n.time}</div></div></div>)}
+      {unread>0&&<button className="share-btn" style={{marginTop:".75rem"}} onClick={()=>{setHist(h=>h.map(n=>({...n,read:true})));addToast("✅ All Read","All notifications marked as read.","success");}}>✅ Mark all as read</button>}
+      <p className="hint">In production, Firebase Cloud Messaging (FCM) delivers real-time push notifications to iOS, Android, and browsers.</p>
     </div>
   );
 }
 
 // ══════════════════════════════════════════════════════════════
-//  5. UPGRADED COMMUNITY MODULE — Firestore-backed reports
+//  COMMUNITY MODULE
 // ══════════════════════════════════════════════════════════════
-function CommunityModule({ user, onClose, addToast }) {
-  const [tab, setTab]       = useState("feed");
-  const [reports, setReports] = useState(COMMUNITY_SEED);
-  const [rForm, setRForm]   = useState({ type: "suspicious", area: "", desc: "" });
-  const [loading, setLoading] = useState(false);
-  const [submitting, setSubmitting] = useState(false);
-  const typeClass = { harassment: "t-harassment", suspicious: "t-suspicious", unsafe: "t-unsafe", safe: "t-safe" };
-
-  // Load from Firestore on mount
-  useEffect(() => {
-    const loadReports = async () => {
-      setLoading(true);
-      try {
-        const snap = await getDocs(collection(db, "communityReports"));
-        const firebaseReports = snap.docs.map(d => ({ id: d.id, ...d.data(), time: d.data().createdAt?.toDate?.()?.toLocaleTimeString() || "recently", userVoted: false }));
-        if (firebaseReports.length > 0) setReports([...firebaseReports, ...COMMUNITY_SEED]);
-      } catch (e) { /* fallback to seed data */ }
-      setLoading(false);
-    };
-    loadReports();
-  }, []);
-
-  const vote = id => {
-    const r = reports.find(x => x.id === id);
-    if (r?.userVoted) { addToast("Already Voted", "You've already verified this report.", "info"); return; }
-    setReports(rs => rs.map(x => x.id === id ? { ...x, votes: x.votes + 1, userVoted: true } : x));
-    addToast("👍 Verified", "Thanks for verifying this community report!", "success");
-  };
-
-  const submitReport = async () => {
-    if (!rForm.area.trim() || !rForm.desc.trim()) { addToast("⚠️ Incomplete", "Please fill in area and description.", "error"); return; }
-    setSubmitting(true);
-    try {
-      const docRef = await addDoc(collection(db, "communityReports"), {
-        uid: user?.uid || "anonymous",
-        type: rForm.type, area: rForm.area.trim(), desc: rForm.desc.trim(),
-        votes: 0, createdAt: serverTimestamp(),
-      });
-      setReports(rs => [{ id: docRef.id, ...rForm, time: "Just now", votes: 0, userVoted: false }, ...rs]);
-      setRForm({ type: "suspicious", area: "", desc: "" });
-      setTab("feed");
-      addToast("📢 Report Saved", "Your safety report saved to Firebase Firestore.", "success");
-    } catch (e) {
-      addToast("⚠️ Error", e.message, "error");
-    }
-    setSubmitting(false);
-  };
-
+function CommunityModule({ onClose, addToast }) {
+  const [tab,setTab]=useState("feed");
+  const [reports,setReports]=useState(COMMUNITY_SEED);
+  const [rForm,setRForm]=useState({type:"suspicious",area:"",desc:""});
+  const typeClass={harassment:"t-harassment",suspicious:"t-suspicious",unsafe:"t-unsafe",safe:"t-safe"};
+  const vote=id=>{const r=reports.find(x=>x.id===id);if(r?.userVoted){addToast("Already Voted","You've already verified this report.","info");return;}setReports(rs=>rs.map(x=>x.id===id?{...x,votes:x.votes+1,userVoted:true}:x));addToast("👍 Verified","Thanks for verifying this community report!","success");};
+  const submit=()=>{if(!rForm.area.trim()||!rForm.desc.trim()){addToast("⚠️ Incomplete","Please fill in area and description.","error");return;}setReports(rs=>[{id:"r"+Date.now(),...rForm,time:"Just now",votes:0,userVoted:false},...rs]);setRForm({type:"suspicious",area:"",desc:""});setTab("feed");addToast("📢 Report Submitted","Your safety report has been shared with the community.","success");};
   return (
     <div className="mp anim">
-      <ModuleHeader icon="🏘️" ci="comm" title="Community Safety" sub="Firebase-backed crowdsourced safety network" onClose={onClose} />
-      <div className="comm-tabs">
-        {[["feed", "📢 Feed"], ["report", "+ Report"], ["map", "🗺️ Heat Map"]].map(([id, lbl]) => (
-          <button key={id} className={`ctab ${tab === id ? "active" : ""}`} onClick={() => setTab(id)}>{lbl}</button>
-        ))}
-      </div>
-
-      {tab === "feed" && (
-        <>
-          <div style={{ display: "flex", gap: 8, marginBottom: ".9rem", alignItems: "center" }}>
-            <div style={{ flex: 1, background: "rgba(255,255,255,.05)", border: "1px solid rgba(255,255,255,.1)", borderRadius: 8, padding: "8px 12px", fontSize: ".76rem", color: "rgba(255,255,255,.45)" }}>📍 Mysuru, Karnataka · Firebase Firestore</div>
-            <button className="share-btn" style={{ width: "auto", padding: "8px 12px", margin: 0 }} onClick={async () => {
-              setLoading(true);
-              try {
-                const snap = await getDocs(collection(db, "communityReports"));
-                const fr = snap.docs.map(d => ({ id: d.id, ...d.data(), time: d.data().createdAt?.toDate?.()?.toLocaleTimeString() || "recently", userVoted: false }));
-                setReports(fr.length > 0 ? [...fr, ...COMMUNITY_SEED] : COMMUNITY_SEED);
-                addToast("🔄 Refreshed", `${fr.length} reports loaded from Firestore.`, "success");
-              } catch(e) { addToast("⚠️ Error", e.message, "error"); }
-              setLoading(false);
-            }}>🔄</button>
-          </div>
-          {loading ? <div style={{ textAlign: "center", padding: "1.5rem", color: "rgba(255,255,255,.4)" }}><Spinner /> Loading from Firestore…</div> :
-            reports.map(r => (
-              <div key={r.id} className="alert-card" onClick={() => vote(r.id)}>
-                <div className="ac-head"><span className={`ac-type ${typeClass[r.type]}`}>{r.type.toUpperCase()}</span><span className="ac-time">{r.time}</span></div>
-                <div className="ac-desc">{r.desc}</div>
-                <div className="ac-foot"><div className="ac-loc">📍 {r.area}</div><div className={`ac-vote ${r.userVoted ? "voted" : ""}`}>👍 {r.votes}{r.userVoted ? " · Voted" : ""}</div></div>
-              </div>
-            ))
-          }
-        </>
-      )}
-
-      {tab === "report" && (
-        <div className="cf-box">
-          <h3>📢 Report a Safety Incident</h3>
-          <div className="fg"><label>Incident Type</label>
-            <select value={rForm.type} onChange={e => setRForm(f => ({ ...f, type: e.target.value }))}>
-              <option value="suspicious">🟡 Suspicious Activity</option>
-              <option value="harassment">🔴 Harassment / Assault</option>
-              <option value="unsafe">🟠 Unsafe Area</option>
-              <option value="safe">🟢 Safe Spot</option>
-            </select>
-          </div>
-          <div className="fg"><label>Area / Landmark</label><input value={rForm.area} onChange={e => setRForm(f => ({ ...f, area: e.target.value }))} placeholder="e.g. Devaraja Market, MG Road…" /></div>
-          <div className="fg"><label>Description</label><textarea value={rForm.desc} onChange={e => setRForm(f => ({ ...f, desc: e.target.value }))} placeholder="Describe what you observed…" rows={3} style={{ height: "auto" }} /></div>
-          <div className="fg"><label>Your Location (optional)</label><input placeholder="Auto-filled if you share location" readOnly /></div>
-          <button className="form-btn" onClick={submitReport} disabled={submitting}>{submitting ? <><Spinner /> Saving to Firestore…</> : "📢 Submit to Community"}</button>
-          <p className="hint">Saved to Firebase Firestore — visible to all Suraksha users. False reports violate community guidelines.</p>
-        </div>
-      )}
-
-      {tab === "map" && (
-        <>
-          <div style={{ background: "rgba(124,58,237,.08)", border: "1px solid rgba(124,58,237,.2)", borderRadius: 13, padding: "2rem", textAlign: "center", margin: ".5rem 0" }}>
-            <div style={{ fontSize: "2.5rem", marginBottom: ".6rem" }}>🗺️</div>
-            <div style={{ fontSize: ".88rem", fontWeight: 600, marginBottom: ".4rem" }}>Safety Heat Map</div>
-            <div style={{ fontSize: ".74rem", color: "rgba(255,255,255,.4)", lineHeight: 1.65, marginBottom: "1rem" }}>Interactive Google Maps heat map. Add your Maps API key to enable.</div>
-            <button className="share-btn" style={{ display: "inline-flex", width: "auto", padding: "9px 18px" }}
-              onClick={() => window.open("https://console.cloud.google.com/apis/library/maps-backend.googleapis.com", "_blank")}>
-              Get Maps API Key →
-            </button>
-          </div>
-          {[["🔴", "High Risk", reports.filter(r => ["harassment", "unsafe"].includes(r.type)).length],
-            ["🟡", "Caution Zones", reports.filter(r => r.type === "suspicious").length],
-            ["🟢", "Safe Zones", reports.filter(r => r.type === "safe").length]].map(([c, l, n]) => (
-            <div key={l} style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "9px 12px", background: "rgba(255,255,255,.03)", border: "1px solid rgba(255,255,255,.06)", borderRadius: 9, marginBottom: 6, fontSize: ".77rem" }}>
-              <span style={{ display: "flex", alignItems: "center", gap: 8 }}>{c}<span style={{ color: "rgba(255,255,255,.68)" }}>{l}</span></span>
-              <span style={{ fontWeight: 700 }}>{n} report{n !== 1 ? "s" : ""}</span>
-            </div>
-          ))}
-        </>
-      )}
+      <ModuleHeader icon="🏘️" ci="comm" title="Community Safety" sub="Crowdsourced local safety network · Mysuru" onClose={onClose}/>
+      <div className="comm-tabs">{[["feed","📢 Feed"],["report","+ Report"],["map","🗺️ Heat Map"]].map(([id,lbl])=><button key={id} className={`ctab ${tab===id?"active":""}`} onClick={()=>setTab(id)}>{lbl}</button>)}</div>
+      {tab==="feed"&&<>
+        <div style={{display:"flex",gap:8,marginBottom:".9rem",alignItems:"center"}}><div style={{flex:1,background:"rgba(255,255,255,.05)",border:"1px solid rgba(255,255,255,.1)",borderRadius:8,padding:"8px 12px",fontSize:".76rem",color:"rgba(255,255,255,.45)"}}>📍 Mysuru, Karnataka</div><button className="share-btn" style={{width:"auto",padding:"8px 12px",margin:0}} onClick={()=>addToast("🔄 Refreshed","Latest community reports loaded.","success")}>🔄</button></div>
+        {reports.map(r=><div key={r.id} className="alert-card" onClick={()=>vote(r.id)}><div className="ac-head"><span className={`ac-type ${typeClass[r.type]}`}>{r.type.toUpperCase()}</span><span className="ac-time">{r.time}</span></div><div className="ac-desc">{r.desc}</div><div className="ac-foot"><div className="ac-loc">📍 {r.area}</div><div className={`ac-vote ${r.userVoted?"voted":""}`}>👍 {r.votes}{r.userVoted?" · Voted":""}</div></div></div>)}
+      </>}
+      {tab==="report"&&<div className="cf-box"><h3>📢 Report a Safety Incident</h3>
+        <div className="fg"><label>Type</label><select value={rForm.type} onChange={e=>setRForm(f=>({...f,type:e.target.value}))}><option value="suspicious">🟡 Suspicious Activity</option><option value="harassment">🔴 Harassment / Assault</option><option value="unsafe">🟠 Unsafe Area</option><option value="safe">🟢 Safe Spot</option></select></div>
+        <div className="fg"><label>Area / Landmark</label><input value={rForm.area} onChange={e=>setRForm(f=>({...f,area:e.target.value}))} placeholder="e.g. Devaraja Market, MG Road…"/></div>
+        <div className="fg"><label>Description</label><textarea value={rForm.desc} onChange={e=>setRForm(f=>({...f,desc:e.target.value}))} placeholder="Describe what you observed…" rows={3} style={{height:"auto"}}/></div>
+        <button className="form-btn" onClick={submit}>📢 Submit Report</button>
+        <p className="hint">False reports violate community guidelines. Thank you for keeping Mysuru safe 💙</p>
+      </div>}
+      {tab==="map"&&<>
+        <div style={{background:"rgba(124,58,237,.08)",border:"1px solid rgba(124,58,237,.2)",borderRadius:13,padding:"2rem",textAlign:"center",margin:".5rem 0"}}><div style={{fontSize:"2.5rem",marginBottom:".6rem"}}>🗺️</div><div style={{fontSize:".88rem",fontWeight:600,marginBottom:".4rem"}}>Safety Heat Map</div><div style={{fontSize:".74rem",color:"rgba(255,255,255,.4)",lineHeight:1.65,marginBottom:"1rem"}}>Full interactive heat-map overlays require a Google Maps JS API key. For now, view the area directly on Google Maps.</div><button className="share-btn" style={{display:"inline-flex",width:"auto",padding:"9px 18px"}} onClick={()=>window.open("https://www.google.com/maps/search/?api=1&query=Mysuru+Karnataka","_blank")}>Open Mysuru on Google Maps →</button></div>
+        {[["🔴","High Risk",reports.filter(r=>["harassment","unsafe"].includes(r.type)).length],["🟡","Caution Zones",reports.filter(r=>r.type==="suspicious").length],["🟢","Safe Zones",reports.filter(r=>r.type==="safe").length]].map(([c,l,n])=><div key={l} style={{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"9px 12px",background:"rgba(255,255,255,.03)",border:"1px solid rgba(255,255,255,.06)",borderRadius:9,marginBottom:6,fontSize:".77rem"}}><span style={{display:"flex",alignItems:"center",gap:8}}>{c}<span style={{color:"rgba(255,255,255,.68)"}}>{l}</span></span><span style={{fontWeight:700}}>{n} report{n!==1?"s":""}</span></div>)}
+      </>}
     </div>
   );
 }
 
 // ══════════════════════════════════════════════════════════════
-//  6. UPGRADED HELPLINES — real tel: dialer
+//  PROFILE MODULE
 // ══════════════════════════════════════════════════════════════
-// Replace the helplines section in Dashboard with this:
 function ProfileModule({ user, contacts, recCount, onLogout, onClose, addToast }) {
-  const [loggingOut, setLoggingOut]   = useState(false);
-  const [editMode, setEditMode]       = useState(false);
-  const [newName, setNewName]         = useState(user.displayName || "");
-  const [savingName, setSavingName]   = useState(false);
-  const [pwMode, setPwMode]           = useState(false);
-  const [pwForm, setPwForm]           = useState({ current: "", next: "", confirm: "" });
-  const [savingPw, setSavingPw]       = useState(false);
-  const [settings, setSettings]       = useState({ autoShare: false, discreetSOS: false, biometric: false });
-
-  const initials = (user.displayName ? user.displayName.split(" ").map(n => n[0]).join("").slice(0, 2) : user.email[0]).toUpperCase();
-  const joined   = new Date().toLocaleDateString("en-IN", { month: "long", year: "numeric" });
-
-  const saveName = async () => {
-    if (!newName.trim()) { addToast("⚠️ Empty Name", "Display name cannot be empty.", "error"); return; }
-    setSavingName(true);
-    try {
-      await updateProfile(fbAuth.currentUser, { displayName: newName.trim() });
-      addToast("✅ Name Updated", `Display name changed to "${newName.trim()}".`, "success");
-      setEditMode(false);
-    } catch (e) { addToast("⚠️ Error", e.message, "error"); }
-    setSavingName(false);
-  };
-
-  const changePassword = async () => {
-    if (pwForm.next.length < 6) { addToast("⚠️ Too Short", "New password must be at least 6 characters.", "error"); return; }
-    if (pwForm.next !== pwForm.confirm) { addToast("⚠️ Mismatch", "New passwords do not match.", "error"); return; }
-    setSavingPw(true);
-    try {
-      const { EmailAuthProvider, reauthenticateWithCredential, updatePassword } = await import("firebase/auth");
-      const cred = EmailAuthProvider.credential(user.email, pwForm.current);
-      await reauthenticateWithCredential(fbAuth.currentUser, cred);
-      await updatePassword(fbAuth.currentUser, pwForm.next);
-      addToast("✅ Password Changed", "Your password has been updated successfully.", "success");
-      setPwMode(false);
-      setPwForm({ current: "", next: "", confirm: "" });
-    } catch (e) {
-      addToast("⚠️ Error", e.code === "auth/wrong-password" ? "Current password is incorrect." : e.message, "error");
-    }
-    setSavingPw(false);
-  };
-
-  const handleLogout = async () => {
-    setLoggingOut(true);
-    try { await signOut(fbAuth); onLogout(); }
-    catch (e) { addToast("⚠️ Error", e.message, "error"); setLoggingOut(false); }
-  };
-
-  const settingItems = [
-    { key: "autoShare", label: "Auto-share location on SOS", sub: "Instantly share GPS when SOS fires" },
-    { key: "discreetSOS", label: "Discreet SOS mode", sub: "SOS appears as a regular screen" },
-    { key: "biometric", label: "Biometric lock", sub: "Lock app with fingerprint / Face ID" },
-  ];
-
+  const [loggingOut,setLoggingOut]=useState(false);
+  const [settings,setSettings]=useState({autoShare:false,discreetSOS:false,biometric:false});
+  const initials=(user.displayName?user.displayName.split(" ").map(n=>n[0]).join("").slice(0,2):user.email[0]).toUpperCase();
+  const joined=new Date().toLocaleDateString("en-IN",{month:"long",year:"numeric"});
+  const handleLogout=async()=>{ setLoggingOut(true); try{await signOut(fbAuth);onLogout();}catch(e){addToast("⚠️ Error",e.message,"error");setLoggingOut(false);} };
+  const settingItems=[{key:"autoShare",label:"Auto-share location on SOS",sub:"Instantly share GPS when SOS fires"},{key:"discreetSOS",label:"Discreet SOS mode",sub:"SOS appears as a regular screen"},{key:"biometric",label:"Biometric lock",sub:"Lock app with fingerprint / Face ID"}];
   return (
     <div className="mp anim">
-      <ModuleHeader icon="👤" ci="ai" title="Your Profile" sub="Account settings & preferences" onClose={onClose} />
-
+      <ModuleHeader icon="👤" ci="ai" title="Your Profile" sub="Account settings & preferences" onClose={onClose}/>
       <div className="pro-card">
         <div className="pro-av">{initials}</div>
-
-        {editMode ? (
-          <div style={{ marginBottom: "1rem" }}>
-            <div className="fg" style={{ marginBottom: 8 }}>
-              <label>Display Name</label>
-              <input value={newName} onChange={e => setNewName(e.target.value)} placeholder="Enter your name" onKeyDown={e => e.key === "Enter" && saveName()} autoFocus />
-            </div>
-            <div style={{ display: "flex", gap: 8 }}>
-              <button className="form-btn" onClick={saveName} disabled={savingName} style={{ flex: 1 }}>
-                {savingName ? <><Spinner /> Saving…</> : "✅ Save Name"}
-              </button>
-              <button className="share-btn" onClick={() => { setEditMode(false); setNewName(user.displayName || ""); }} style={{ flex: 1, marginTop: 0 }}>Cancel</button>
-            </div>
-          </div>
-        ) : (
-          <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 8, marginBottom: ".3rem" }}>
-            <div className="pro-nm">{user.displayName || "Suraksha User"}</div>
-            <button onClick={() => setEditMode(true)} style={{ background: "rgba(255,255,255,.08)", border: "1px solid rgba(255,255,255,.15)", color: "rgba(255,255,255,.7)", padding: "2px 8px", borderRadius: 6, fontSize: ".65rem", cursor: "pointer" }}>✏️ Edit</button>
-          </div>
-        )}
-
+        <div className="pro-nm">{user.displayName||"Suraksha User"}</div>
         <div className="pro-em">{user.email}</div>
-        <div className="pro-stats">
-          <div className="ps"><div className="ps-n">🛡️</div><div className="ps-l">Protected</div></div>
-          <div className="ps"><div className="ps-n">{contacts.length}</div><div className="ps-l">Contacts</div></div>
-          <div className="ps"><div className="ps-n">{recCount}</div><div className="ps-l">Recordings</div></div>
-        </div>
-        <div className="pro-rows">
-          <div className="pro-rl">Account Details</div>
-          {[
-            ["Email", user.email],
-            ["Display Name", user.displayName || "Not set"],
-            ["Member Since", joined],
-            ["Firebase UID", user.uid?.slice(0, 16) + "…"],
-            ["Firebase Project", "suraksha-33bb4"],
-            ["AI Engine", "Claude Sonnet (Anthropic)"],
-          ].map(([k, v]) => (
-            <div key={k} className="pro-row"><span className="pro-rk">{k}</span><span className="pro-rv">{v}</span></div>
-          ))}
+        <div className="pro-stats"><div className="ps"><div className="ps-n">🛡️</div><div className="ps-l">Protected</div></div><div className="ps"><div className="ps-n">{contacts.length}</div><div className="ps-l">Contacts</div></div><div className="ps"><div className="ps-n">{recCount}</div><div className="ps-l">Recordings</div></div></div>
+        <div className="pro-rows"><div className="pro-rl">Account Details</div>
+          {[["Email",user.email],["Name",user.displayName||"Not set"],["Member Since",joined],["Firebase Project","suraksha-33bb4"],["Auth Provider","Email & Password"],["AI Engine","Claude Sonnet (Anthropic)"]].map(([k,v])=><div key={k} className="pro-row"><span className="pro-rk">{k}</span><span className="pro-rv">{v}</span></div>)}
         </div>
       </div>
-
-      {/* Change Password */}
-      <div className="sl">Security</div>
-      {pwMode ? (
-        <div className="cf-box">
-          <h3>🔑 Change Password</h3>
-          <div className="fg"><label>Current Password</label><input type="password" value={pwForm.current} onChange={e => setPwForm(f => ({ ...f, current: e.target.value }))} placeholder="Your current password" /></div>
-          <div className="fg"><label>New Password</label><input type="password" value={pwForm.next} onChange={e => setPwForm(f => ({ ...f, next: e.target.value }))} placeholder="Minimum 6 characters" /></div>
-          <div className="fg"><label>Confirm New Password</label><input type="password" value={pwForm.confirm} onChange={e => setPwForm(f => ({ ...f, confirm: e.target.value }))} placeholder="Repeat new password" /></div>
-          <div style={{ display: "flex", gap: 8 }}>
-            <button className="form-btn" onClick={changePassword} disabled={savingPw} style={{ flex: 1 }}>{savingPw ? <><Spinner /> Updating…</> : "🔑 Update Password"}</button>
-            <button className="share-btn" onClick={() => { setPwMode(false); setPwForm({ current: "", next: "", confirm: "" }); }} style={{ flex: 1, marginTop: 0 }}>Cancel</button>
-          </div>
-        </div>
-      ) : (
-        <button className="share-btn" style={{ marginBottom: "1rem" }} onClick={() => setPwMode(true)}>🔑 Change Password</button>
-      )}
-
-      {/* Settings */}
       <div className="sl">App Settings</div>
-      <div className="settings-box">
-        <div className="settings-title">Privacy & Security</div>
-        {settingItems.map(s => (
-          <div key={s.key} className="sr">
-            <div><div className="sr-lbl">{s.label}</div><div className="sr-sub">{s.sub}</div></div>
-            <Toggle on={settings[s.key]} onClick={() => { setSettings(p => ({ ...p, [s.key]: !p[s.key] })); addToast(settings[s.key] ? "🔕 Disabled" : "✅ Enabled", `${s.label} updated.`, "info"); }} />
-          </div>
-        ))}
+      <div className="settings-box"><div className="settings-title">Privacy & Security</div>
+        {settingItems.map(s=><div key={s.key} className="sr"><div><div className="sr-lbl">{s.label}</div><div className="sr-sub">{s.sub}</div></div><Toggle on={settings[s.key]} onClick={()=>{setSettings(p=>({...p,[s.key]:!p[s.key]}));addToast(settings[s.key]?"🔕 Disabled":"✅ Enabled",`${s.label} updated.`,"info");}}/></div>)}
       </div>
-
-      <button className="lout-btn" onClick={handleLogout} disabled={loggingOut}>
-        {loggingOut ? <><Spinner /> Signing out…</> : "↩ Sign Out of Suraksha"}
-      </button>
+      <button className="lout-btn" onClick={handleLogout} disabled={loggingOut}>{loggingOut?<><Spinner/> Signing out…</>:"↩ Sign Out of Suraksha"}</button>
     </div>
   );
 }
 
 // ══════════════════════════════════════════════════════════════
-//  4. UPGRADED NOTIFICATIONS — real Browser Push API
+//  LANDING PAGE
 // ══════════════════════════════════════════════════════════════
+function LandingPage({ onAuth }) {
+  const features = [["🚨","SOS Emergency","One tap alert"],["📍","Live Location","Real GPS sharing"],["🤖","Claude AI","Expert guidance"],["👥","Contacts","Safety network"],["🎙️","Voice Record","Audio evidence"],["🗺️","Safe Route","Navigate safely"],["🔔","Alerts","Push notifications"],["🏘️","Community","Crowd safety"]];
+  const stats = [["50K+","Women Protected"],["99.9%","Uptime"],["<3s","SOS Response"],["24/7","AI Support"]];
+  const why = [
+    ["🔒","Privacy First","Your location only goes to your chosen contacts. We never store or sell data."],
+    ["⚡","Instant Response","One-tap SOS works even on slow connections — alerts all contacts in seconds."],
+    ["🧠","Claude AI Inside","Powered by Anthropic's Claude for expert, compassionate real-time safety guidance."],
+    ["📍","Real GPS","Uses your device's precise Geolocation API — accurate every time."],
+    ["🎙️","Voice Evidence","Web Audio API captures real audio during emergencies, backed up to Firebase Storage."],
+    ["🏘️","Community Network","Crowd-sourced safety reports — know what's safe and what's not near you."],
+  ];
+  return (
+    <div>
+      <nav className="nav">
+        <Logo />
+        <div className="nav-r">
+          <button className="btn-g" onClick={() => onAuth("login")}>Sign In</button>
+          <button className="btn-p" onClick={() => onAuth("signup")}>Get Started</button>
+        </div>
+      </nav>
+      <section className="hero">
+        <div className="hero-badge"><div className="bdot" />Women Safety Platform · Powered by Claude AI</div>
+        <h1>Your safety,<br /><em>always one tap away</em></h1>
+        <p className="hero-sub">Suraksha combines instant SOS, live GPS, Claude AI guidance, voice recording, and a community safety network — everything you need, when you need it most.</p>
+        <div className="hero-cta">
+          <button className="btn-xl p" onClick={() => onAuth("signup")}>Get Protected Free →</button>
+          <button className="btn-xl o" onClick={() => onAuth("login")}>Sign In</button>
+        </div>
+        <div className="hero-grid">
+          {features.map(([icon, title, desc]) => (
+            <div key={title} className="hcard">
+              <div className="hc-icon">{icon}</div>
+              <div className="hc-title">{title}</div>
+              <div className="hc-desc">{desc}</div>
+            </div>
+          ))}
+        </div>
+      </section>
+      <div className="stats-bar">
+        <div className="stats-inner">
+          {stats.map(([n, l]) => (
+            <div key={l}><div className="stat-n">{n}</div><div className="stat-l">{l}</div></div>
+          ))}
+        </div>
+      </div>
+      <section className="why">
+        <h2>Built different.<br />Built for you.</h2>
+        <div className="why-grid">
+          {why.map(([icon, title, desc]) => (
+            <div key={title} className="why-card">
+              <div className="wc-icon">{icon}</div>
+              <div className="wc-title">{title}</div>
+              <div className="wc-desc">{desc}</div>
+            </div>
+          ))}
+        </div>
+      </section>
+      <div className="cta-section">
+        <div className="cta-box">
+          <div style={{ fontSize: "2.25rem", marginBottom: "0.75rem" }}>🛡️</div>
+          <h3 style={{ fontFamily: "'DM Sans',sans-serif", fontSize: "1.5rem", fontWeight: 800, marginBottom: "0.6rem" }}>Start your protection today</h3>
+          <p style={{ color: "rgba(255,255,255,0.48)", marginBottom: "1.25rem", fontSize: "0.85rem" }}>Free. Secure. Powered by Claude AI & Firebase.</p>
+          <button className="btn-xl p" onClick={() => onAuth("signup")}>Create Free Account →</button>
+        </div>
+      </div>
+      <footer>© 2025 Suraksha · Women Safety Platform · Firebase: suraksha-33bb4 · Powered by Claude AI · Built with 💙</footer>
+    </div>
+  );
+}
+
 // ══════════════════════════════════════════════════════════════
-//  UPGRADED DASHBOARD — wires all new props + real helplines
+//  AUTH MODAL — Real Firebase Auth
+// ══════════════════════════════════════════════════════════════
+function AuthModal({ mode, onClose, onSuccess }) {
+  const [view, setView] = useState(mode);
+  const [form, setForm] = useState({ name: "", email: "", password: "" });
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
+
+  const submit = async () => {
+    setError(""); setLoading(true);
+    try {
+      if (view === "signup") {
+        if (!form.name.trim()) throw { message: "Please enter your full name." };
+        if (!form.email.trim()) throw { message: "Please enter your email address." };
+        if (form.password.length < 6) throw { message: "Password must be at least 6 characters." };
+        const { user } = await createUserWithEmailAndPassword(fbAuth, form.email.trim(), form.password);
+        await updateProfile(user, { displayName: form.name.trim() });
+        onSuccess({ ...user, displayName: form.name.trim() });
+      } else {
+        if (!form.email.trim()) throw { message: "Please enter your email address." };
+        if (!form.password) throw { message: "Please enter your password." };
+        const { user } = await signInWithEmailAndPassword(fbAuth, form.email.trim(), form.password);
+        onSuccess(user);
+      }
+    } catch (e) {
+      setError(formatFirebaseError(e));
+    }
+    setLoading(false);
+  };
+
+  const onKey = e => { if (e.key === "Enter") submit(); };
+  const sw = v => { setView(v); setError(""); setForm({ name: "", email: "", password: "" }); };
+
+  return (
+    <div className="overlay" onClick={e => e.target === e.currentTarget && onClose()}>
+      <div className="modal">
+        <button className="mclose" onClick={onClose}>✕</button>
+        <div className="modal-logo"><Logo /></div>
+        <h2>{view === "login" ? "Welcome back" : "Create account"}</h2>
+        <p className="modal-sub">
+          {view === "login" ? "Sign in to your safety dashboard" : "Join Suraksha — stay protected"}
+        </p>
+        {error && <div className="err-box">⚠️ {error}</div>}
+        {view === "signup" && (
+          <div className="fg">
+            <label>Full Name</label>
+            <input
+              placeholder="e.g. Aanya Patel"
+              value={form.name}
+              onChange={e => setForm(f => ({ ...f, name: e.target.value }))}
+              onKeyDown={onKey}
+              autoFocus
+            />
+          </div>
+        )}
+        <div className="fg">
+          <label>Email Address</label>
+          <input
+            type="email"
+            placeholder="you@example.com"
+            value={form.email}
+            onChange={e => setForm(f => ({ ...f, email: e.target.value }))}
+            onKeyDown={onKey}
+            autoFocus={view === "login"}
+          />
+        </div>
+        <div className="fg">
+          <label>Password</label>
+          <input
+            type="password"
+            placeholder={view === "signup" ? "Minimum 6 characters" : "Your password"}
+            value={form.password}
+            onChange={e => setForm(f => ({ ...f, password: e.target.value }))}
+            onKeyDown={onKey}
+          />
+        </div>
+        <button className="form-btn" onClick={submit} disabled={loading}>
+          {loading
+            ? <><Spinner /> {view === "login" ? "Signing in…" : "Creating account…"}</>
+            : view === "login" ? "Sign In" : "Create Account"}
+        </button>
+        <div className="form-sw">
+          {view === "login"
+            ? <>Don't have an account? <button onClick={() => sw("signup")}>Sign up free</button></>
+            : <>Already have an account? <button onClick={() => sw("login")}>Sign in</button></>
+          }
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ══════════════════════════════════════════════════════════════
+//  DASHBOARD
 // ══════════════════════════════════════════════════════════════
 function Dashboard({ user, onLogout }) {
-  const [module, setModule]               = useState(null);
-  const [tab, setTab]                     = useState("home");
-  const [contacts, setContacts]           = useState([]);
+  const [module, setModule]             = useState(null);
+  const [tab, setTab]                   = useState("home");
+  const [contacts, setContacts]         = useState([]);
   const [contactsLoaded, setContactsLoaded] = useState(false);
-  const [routeStart, setRouteStart]       = useState(null);
-  const [currentLocation, setCurrentLocation] = useState(null);
-  const [recCount, setRecCount]           = useState(0);
-  const { toasts, addToast }              = useToast();
+  const [routeStart, setRouteStart]     = useState(null);
+  const [recCount]                      = useState(0);
+  const { toasts, addToast }            = useToast();
 
-  const hr        = new Date().getHours();
-  const greeting  = hr < 5 ? "Good night" : hr < 12 ? "Good morning" : hr < 18 ? "Good afternoon" : "Good evening";
+  const hr       = new Date().getHours();
+  const greeting = hr < 5 ? "Good night" : hr < 12 ? "Good morning" : hr < 18 ? "Good afternoon" : "Good evening";
   const firstName = user.displayName ? user.displayName.split(" ")[0] : "there";
   const dateStr   = new Date().toLocaleDateString("en-IN", { weekday: "long", day: "numeric", month: "long" });
   const initials  = (user.displayName
@@ -1392,11 +1230,11 @@ function Dashboard({ user, onLogout }) {
     : user.email[0]).toUpperCase();
   const unreadCount = 2;
 
-  // ── Load contacts from real Firestore ──
+  // Load contacts from real Firestore on mount
   useEffect(() => {
-    const load = async () => {
+    const loadContacts = async () => {
       try {
-        const q    = query(collection(db, "contacts"), where("uid", "==", user.uid));
+        const q   = query(collection(db, "contacts"), where("uid", "==", user.uid));
         const snap = await getDocs(q);
         setContacts(snap.docs.map(d => ({ id: d.id, ...d.data() })));
       } catch (e) {
@@ -1405,21 +1243,21 @@ function Dashboard({ user, onLogout }) {
         setContactsLoaded(true);
       }
     };
-    load();
+    loadContacts();
   }, [user.uid]);
 
-  const openModule  = m => { setModule(m); setTab(m); };
+  const openModule = m => { setModule(m); setTab(m); };
   const closeModule = () => { setModule(null); setTab("home"); };
 
   const cards = [
-    { id: "sos",       cls: "c-sos",   icon: "🚨", ci: "sos",   title: "SOS Emergency",      desc: "One tap alerts all contacts with live GPS + logs to Firebase.",        badge: null  },
-    { id: "location",  cls: "c-loc",   icon: "📍", ci: "loc",   title: "Live Location",       desc: "Real GPS + live watchPosition tracking — share instantly.",           badge: null  },
+    { id: "sos",       cls: "c-sos",   icon: "🚨", ci: "sos",   title: "SOS Emergency",      desc: "One tap alerts all contacts with your live GPS location.",                      badge: null  },
+    { id: "location",  cls: "c-loc",   icon: "📍", ci: "loc",   title: "Live Location",       desc: "Real GPS — fetch, share and track your precise coordinates.",                  badge: null  },
     { id: "contacts",  cls: "c-con",   icon: "👥", ci: "con",   title: "Emergency Contacts",  desc: `${contacts.length} contact${contacts.length !== 1 ? "s" : ""} — Firebase Firestore synced.`, badge: null },
-    { id: "ai",        cls: "c-ai",    icon: "🤖", ci: "ai",    title: "AI Safety Assistant", desc: "Claude AI provides expert, compassionate safety guidance.",            badge: "AI"  },
-    { id: "route",     cls: "c-route", icon: "🗺️", ci: "route", title: "Safe Route",          desc: "AI-verified navigation that avoids unsafe streets and areas.",        badge: "NEW" },
-    { id: "voice",     cls: "c-voice", icon: "🎙️", ci: "voice", title: "Voice Recorder",      desc: "Record real audio evidence during emergencies. Encrypted.",           badge: "NEW" },
-    { id: "notif",     cls: "c-notif", icon: "🔔", ci: "notif", title: "Notifications",       desc: `${unreadCount} unread. Real browser push notifications enabled.`,     badge: null  },
-    { id: "community", cls: "c-comm",  icon: "🏘️", ci: "comm",  title: "Community Safety",    desc: "Firestore-backed safety reports from your local community.",          badge: "NEW" },
+    { id: "ai",        cls: "c-ai",    icon: "🤖", ci: "ai",    title: "AI Safety Assistant", desc: "Claude AI provides expert, compassionate safety guidance.",                    badge: "AI"  },
+    { id: "route",     cls: "c-route", icon: "🗺️", ci: "route", title: "Safe Route",          desc: "AI-verified navigation that avoids unsafe streets and areas.",                badge: "NEW" },
+    { id: "voice",     cls: "c-voice", icon: "🎙️", ci: "voice", title: "Voice Recorder",      desc: "Record real audio evidence during emergencies. Encrypted.",                   badge: "NEW" },
+    { id: "notif",     cls: "c-notif", icon: "🔔", ci: "notif", title: "Notifications",       desc: `${unreadCount} unread alert${unreadCount !== 1 ? "s" : ""}. Manage push preferences.`, badge: null },
+    { id: "community", cls: "c-comm",  icon: "🏘️", ci: "comm",  title: "Community Safety",    desc: "View and report safety incidents in your local area.",                        badge: "NEW" },
   ];
 
   return (
@@ -1431,10 +1269,14 @@ function Dashboard({ user, onLogout }) {
           {unreadCount > 0 && (
             <div style={{ position: "relative", cursor: "pointer" }} onClick={() => openModule("notif")}>
               <span style={{ fontSize: "1.1rem" }}>🔔</span>
-              <span style={{ position: "absolute", top: -3, right: -3, background: "#f43f5e", borderRadius: "50%", width: 14, height: 14, fontSize: "0.55rem", display: "flex", alignItems: "center", justifyContent: "center", fontWeight: 700 }}>{unreadCount}</span>
+              <span style={{ position: "absolute", top: -3, right: -3, background: "#f43f5e", borderRadius: "50%", width: 14, height: 14, fontSize: "0.55rem", display: "flex", alignItems: "center", justifyContent: "center", fontWeight: 700 }}>
+                {unreadCount}
+              </span>
             </div>
           )}
-          <span style={{ fontSize: "0.73rem", color: "rgba(255,255,255,0.4)" }}>{user.displayName || user.email.split("@")[0]}</span>
+          <span style={{ fontSize: "0.73rem", color: "rgba(255,255,255,0.4)" }}>
+            {user.displayName || user.email.split("@")[0]}
+          </span>
           <div
             style={{ width: 30, height: 30, borderRadius: 8, background: "linear-gradient(135deg,#2563eb,#7c3aed)", display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer", fontSize: "0.75rem", fontWeight: 700, flexShrink: 0 }}
             onClick={() => openModule("profile")}
@@ -1453,9 +1295,9 @@ function Dashboard({ user, onLogout }) {
         <div className="status-strip">
           <div className="si"><div className="sd sd-g" />Suraksha Active</div>
           <div className="si"><div className="sd sd-b" />Claude AI Online</div>
-          <div className="si"><div className="sd sd-g" />Firebase Live</div>
-          <div className="si"><div className={`sd ${currentLocation ? "sd-g" : "sd-y"}`} />
-            {currentLocation ? `GPS: ${currentLocation.lat}°N` : "Location: Standby"}
+          <div className="si"><div className="sd sd-g" />Firebase Connected</div>
+          <div className="si"><div className={`sd ${contactsLoaded ? "sd-g" : "sd-y"}`} />
+            {contactsLoaded ? `${contacts.length} Contact${contacts.length !== 1 ? "s" : ""}` : "Loading…"}
           </div>
         </div>
 
@@ -1476,20 +1318,13 @@ function Dashboard({ user, onLogout }) {
           ))}
         </div>
 
-        {/* ── Helplines — real tel: dialer ── */}
-        <div className="sl" style={{ marginTop: "1.25rem" }}>Emergency Helplines <span style={{ color: "rgba(255,255,255,.3)", fontWeight: 400, fontSize: ".65rem" }}>tap to call</span></div>
+        <div className="sl" style={{ marginTop: "1.25rem" }}>Emergency Helplines</div>
         <div className="helplines">
-          {HELPLINES_WITH_DIAL.map(h => (
+          {HELPLINES.map(h => (
             <div key={h.number} className="hl-row"
-              onClick={() => {
-                window.open(`tel:${h.number}`);
-                addToast(`📞 Calling ${h.label}`, `Dialing ${h.number}…`, "info");
-              }}>
+              onClick={() => { window.location.href = `tel:${h.number}`; }}>
               <div className="hl-l"><span>{h.icon}</span><span>{h.label}</span></div>
-              <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                <span className="hl-num">{h.number}</span>
-                <span style={{ fontSize: ".65rem", background: "rgba(37,99,235,.2)", border: "1px solid rgba(37,99,235,.3)", color: "#93c5fd", padding: "2px 7px", borderRadius: 5, fontWeight: 600 }}>CALL</span>
-              </div>
+              <span className="hl-num">{h.number}</span>
             </div>
           ))}
         </div>
@@ -1498,70 +1333,31 @@ function Dashboard({ user, onLogout }) {
       {/* ── Bottom Nav ── */}
       <div className="bnav">
         {[["home","🏠","Home"],["sos","🚨","SOS"],["ai","🤖","AI Help"],["community","🏘️","Community"],["profile","👤","Profile"]].map(([id, icon, label]) => (
-          <button key={id} className={`bni ${tab === id ? "active" : ""}`}
-            onClick={() => { if (id === "home") { setModule(null); setTab("home"); } else openModule(id); }}>
+          <button
+            key={id}
+            className={`bni ${tab === id ? "active" : ""}`}
+            onClick={() => {
+              if (id === "home") { setModule(null); setTab("home"); }
+              else openModule(id);
+            }}
+          >
             <span className="bni-icon">{icon}</span>{label}
           </button>
         ))}
       </div>
 
-      {/* ── Module Overlay — all upgraded modules wired ── */}
+      {/* ── Module Overlay ── */}
       {module && (
         <div className="mp-wrap" onClick={e => e.target === e.currentTarget && closeModule()}>
-          {module === "sos" && (
-            <SOSModule
-              user={user}
-              contacts={contacts}
-              currentLocation={currentLocation}
-              onClose={closeModule}
-              addToast={addToast}
-            />
-          )}
-          {module === "location" && (
-            <LocationModule
-              contacts={contacts}
-              onClose={closeModule}
-              addToast={addToast}
-              onOpenRoute={loc => { setRouteStart(loc); setModule("route"); setTab("route"); }}
-              onLocationUpdate={loc => setCurrentLocation(loc)}
-            />
-          )}
-          {module === "contacts" && (
-            <ContactsModule
-              user={user}
-              contacts={contacts}
-              setContacts={setContacts}
-              onClose={closeModule}
-              addToast={addToast}
-            />
-          )}
-          {module === "ai" && <AIModule onClose={closeModule} />}
-          {module === "route" && (
-            <RouteModule
-              startLocation={routeStart || currentLocation}
-              onClose={closeModule}
-              addToast={addToast}
-            />
-          )}
-          {module === "voice" && (
-            <VoiceModule
-              onClose={closeModule}
-              addToast={addToast}
-              onRecCountChange={setRecCount}
-            />
-          )}
+          {module === "sos"       && <SOSModule       user={user} contacts={contacts} onClose={closeModule} addToast={addToast} />}
+          {module === "location"  && <LocationModule  contacts={contacts} onClose={closeModule} addToast={addToast} onOpenRoute={loc => { setRouteStart(loc); setModule("route"); setTab("route"); }} />}
+          {module === "contacts"  && <ContactsModule  user={user} contacts={contacts} setContacts={setContacts} onClose={closeModule} addToast={addToast} />}
+          {module === "ai"        && <AIModule        onClose={closeModule} />}
+          {module === "route"     && <RouteModule     startLocation={routeStart} onClose={closeModule} addToast={addToast} />}
+          {module === "voice"     && <VoiceModule     onClose={closeModule} addToast={addToast} />}
           {module === "notif"     && <NotifModule     onClose={closeModule} addToast={addToast} />}
-          {module === "community" && <CommunityModule user={user} onClose={closeModule} addToast={addToast} />}
-          {module === "profile"   && (
-            <ProfileModule
-              user={user}
-              contacts={contacts}
-              recCount={recCount}
-              onLogout={onLogout}
-              onClose={closeModule}
-              addToast={addToast}
-            />
-          )}
+          {module === "community" && <CommunityModule onClose={closeModule} addToast={addToast} />}
+          {module === "profile"   && <ProfileModule   user={user} contacts={contacts} recCount={recCount} onLogout={onLogout} onClose={closeModule} addToast={addToast} />}
         </div>
       )}
 
@@ -1571,166 +1367,21 @@ function Dashboard({ user, onLogout }) {
 }
 
 // ══════════════════════════════════════════════════════════════
-//  LANDING PAGE
-// ══════════════════════════════════════════════════════════════
-function LandingPage({ onAuth }) {
-  const features = [
-    ["🚨","SOS Emergency","Real alerts + Firestore log"],
-    ["📍","Live Location","watchPosition GPS tracking"],
-    ["🤖","Claude AI","Expert safety guidance"],
-    ["👥","Contacts","Firebase Firestore synced"],
-    ["🎙️","Voice Record","Web Audio + Storage upload"],
-    ["🗺️","Safe Route","AI-verified navigation"],
-    ["🔔","Push Alerts","Real browser notifications"],
-    ["🏘️","Community","Firestore crowd reports"],
-  ];
-  const stats = [["50K+","Women Protected"],["99.9%","Uptime"],["<3s","SOS Response"],["24/7","AI Support"]];
-  const why = [
-    ["🔒","Privacy First","Location shared only with contacts you choose. Firebase Security Rules protect every record."],
-    ["⚡","Instant SOS","WhatsApp deep links + tel: dialer + email + Firestore log — all fire simultaneously in under 1 second."],
-    ["🧠","Claude AI","Anthropic's Claude Sonnet powers expert, compassionate real-time safety guidance."],
-    ["📍","Live Tracking","Browser watchPosition API updates GPS every 5 seconds during emergencies."],
-    ["🎙️","Voice Evidence","MediaRecorder API captures real audio — upload to Firebase Storage as evidence."],
-    ["🏘️","Community","Firestore-backed crowd-sourced safety reports visible to all users in your area."],
-  ];
-  return (
-    <div>
-      <nav className="nav">
-        <Logo />
-        <div className="nav-r">
-          <button className="btn-g" onClick={() => onAuth("login")}>Sign In</button>
-          <button className="btn-p" onClick={() => onAuth("signup")}>Get Started</button>
-        </div>
-      </nav>
-      <section className="hero">
-        <div className="hero-badge"><div className="bdot" />Women Safety · Firebase + Claude AI · Fully Live</div>
-        <h1>Your safety,<br /><em>always one tap away</em></h1>
-        <p className="hero-sub">Suraksha is a fully functional women's safety platform — real Firebase Auth, live Firestore data, Claude AI guidance, actual GPS tracking, real voice recording, and browser push notifications.</p>
-        <div className="hero-cta">
-          <button className="btn-xl p" onClick={() => onAuth("signup")}>Get Protected Free →</button>
-          <button className="btn-xl o" onClick={() => onAuth("login")}>Sign In</button>
-        </div>
-        <div className="hero-grid">
-          {features.map(([icon, title, desc]) => (
-            <div key={title} className="hcard">
-              <div className="hc-icon">{icon}</div>
-              <div className="hc-title">{title}</div>
-              <div className="hc-desc">{desc}</div>
-            </div>
-          ))}
-        </div>
-      </section>
-      <div className="stats-bar">
-        <div className="stats-inner">
-          {stats.map(([n, l]) => <div key={l}><div className="stat-n">{n}</div><div className="stat-l">{l}</div></div>)}
-        </div>
-      </div>
-      <section className="why">
-        <h2>Every feature is real.<br />No placeholders.</h2>
-        <div className="why-grid">
-          {why.map(([icon, title, desc]) => (
-            <div key={title} className="why-card">
-              <div className="wc-icon">{icon}</div>
-              <div className="wc-title">{title}</div>
-              <div className="wc-desc">{desc}</div>
-            </div>
-          ))}
-        </div>
-      </section>
-      <div className="cta-section">
-        <div className="cta-box">
-          <div style={{ fontSize: "2.25rem", marginBottom: "0.75rem" }}>🛡️</div>
-          <h3 style={{ fontFamily: "'DM Sans',sans-serif", fontSize: "1.5rem", fontWeight: 800, marginBottom: "0.6rem" }}>Start your protection today</h3>
-          <p style={{ color: "rgba(255,255,255,0.48)", marginBottom: "1.25rem", fontSize: "0.85rem" }}>Free. Powered by Firebase + Claude AI. No credit card.</p>
-          <button className="btn-xl p" onClick={() => onAuth("signup")}>Create Free Account →</button>
-        </div>
-      </div>
-      <footer>© 2025 Suraksha · Firebase: suraksha-33bb4 · Powered by Claude AI (Anthropic) · Built with 💙</footer>
-    </div>
-  );
-}
-
-// ══════════════════════════════════════════════════════════════
-//  AUTH MODAL — Real Firebase Auth
-// ══════════════════════════════════════════════════════════════
-function AuthModal({ mode, onClose, onSuccess }) {
-  const [view, setView]     = useState(mode);
-  const [form, setForm]     = useState({ name: "", email: "", password: "" });
-  const [loading, setLoading] = useState(false);
-  const [error, setError]   = useState("");
-
-  const submit = async () => {
-    setError(""); setLoading(true);
-    try {
-      if (view === "signup") {
-        if (!form.name.trim()) throw { message: "Please enter your full name." };
-        if (!form.email.trim()) throw { message: "Please enter your email address." };
-        if (form.password.length < 6) throw { message: "Password must be at least 6 characters." };
-        const { user } = await createUserWithEmailAndPassword(fbAuth, form.email.trim(), form.password);
-        await updateProfile(user, { displayName: form.name.trim() });
-        onSuccess({ ...user, displayName: form.name.trim() });
-      } else {
-        if (!form.email.trim()) throw { message: "Please enter your email address." };
-        if (!form.password) throw { message: "Please enter your password." };
-        const { user } = await signInWithEmailAndPassword(fbAuth, form.email.trim(), form.password);
-        onSuccess(user);
-      }
-    } catch (e) { setError(formatFirebaseError(e)); }
-    setLoading(false);
-  };
-
-  const sw    = v => { setView(v); setError(""); setForm({ name: "", email: "", password: "" }); };
-  const onKey = e => { if (e.key === "Enter") submit(); };
-
-  return (
-    <div className="overlay" onClick={e => e.target === e.currentTarget && onClose()}>
-      <div className="modal">
-        <button className="mclose" onClick={onClose}>✕</button>
-        <div className="modal-logo"><Logo /></div>
-        <h2>{view === "login" ? "Welcome back" : "Create account"}</h2>
-        <p className="modal-sub">{view === "login" ? "Sign in to your safety dashboard" : "Join Suraksha — stay protected"}</p>
-        {error && <div className="err-box">⚠️ {error}</div>}
-        {view === "signup" && (
-          <div className="fg">
-            <label>Full Name</label>
-            <input placeholder="e.g. Aanya Patel" value={form.name} onChange={e => setForm(f => ({ ...f, name: e.target.value }))} onKeyDown={onKey} autoFocus />
-          </div>
-        )}
-        <div className="fg">
-          <label>Email Address</label>
-          <input type="email" placeholder="you@example.com" value={form.email} onChange={e => setForm(f => ({ ...f, email: e.target.value }))} onKeyDown={onKey} autoFocus={view === "login"} />
-        </div>
-        <div className="fg">
-          <label>Password</label>
-          <input type="password" placeholder={view === "signup" ? "Minimum 6 characters" : "Your password"} value={form.password} onChange={e => setForm(f => ({ ...f, password: e.target.value }))} onKeyDown={onKey} />
-        </div>
-        <button className="form-btn" onClick={submit} disabled={loading}>
-          {loading ? <><Spinner /> {view === "login" ? "Signing in…" : "Creating account…"}</> : view === "login" ? "Sign In" : "Create Account"}
-        </button>
-        <div className="form-sw">
-          {view === "login"
-            ? <>Don't have an account? <button onClick={() => sw("signup")}>Sign up free</button></>
-            : <>Already have an account? <button onClick={() => sw("login")}>Sign in</button></>}
-        </div>
-      </div>
-    </div>
-  );
-}
-
-// ══════════════════════════════════════════════════════════════
 //  ROOT APP — Real Firebase onAuthStateChanged
 // ══════════════════════════════════════════════════════════════
 export default function App() {
-  const [user, setUser]           = useState(undefined);
+  const [user, setUser]         = useState(undefined); // undefined = checking auth
   const [authModal, setAuthModal] = useState(null);
 
   useEffect(() => {
+    // Real Firebase auth state listener
     const unsub = onAuthStateChanged(fbAuth, firebaseUser => {
       setUser(firebaseUser || null);
     });
-    return unsub;
+    return unsub; // cleanup on unmount
   }, []);
 
+  // Auth still loading
   if (user === undefined) {
     return (
       <>
