@@ -41,6 +41,9 @@ export default async function handler(req, res) {
     : null;
 
   const isLocationOnly = Array.isArray(channels) && channels.length === 1 && channels[0] === "sms";
+  const messageText = isLocationOnly
+      ? ' 📍 Live location from ${userName}:\n${mapsLink || "Location UnAvailable."}\n Sent Via Suraksha Safety Apps.'
+      : `🚨 SOS ALERT from ${userName}\n They Are In TROUBLE. HELP them URGENTLY.\n {mapsLink ?'Live Location : ${mapsLink}' : "Location is UnAvailalble."}\ An Message From Suraksha - Women Safety App.';
 
   const messageText = isLocationOnly
     ? `📍 Live location from ${userName || "a Suraksha user"}:\n` +
